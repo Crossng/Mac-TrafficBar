@@ -723,6 +723,15 @@ final class AppIconProvider {
             return nil
         }
 
+        // nettop often reports a bundle identifier (for example,
+        // com.google.Chrome) instead of the app's display name. Resolve that
+        // identifier directly before falling back to name-based matching.
+        for candidate in candidates {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: candidate) {
+                return NSWorkspace.shared.icon(forFile: url.path)
+            }
+        }
+
         if let runningIcon = iconFromRunningApplications(matching: candidates) {
             return runningIcon
         }
@@ -742,6 +751,7 @@ final class AppIconProvider {
         for application in NSWorkspace.shared.runningApplications {
             let names = [
                 application.localizedName,
+                application.bundleIdentifier,
                 application.bundleURL?.deletingPathExtension().lastPathComponent,
                 application.executableURL?.deletingPathExtension().lastPathComponent
             ].compactMap { $0?.lowercased() }
@@ -794,6 +804,7 @@ final class AppIconProvider {
         }
 
         let info = bundle.localizedInfoDictionary ?? bundle.infoDictionary ?? [:]
+        insert(bundle.bundleIdentifier, url: url, into: &index)
         insert(info["CFBundleDisplayName"] as? String, url: url, into: &index)
         insert(info["CFBundleName"] as? String, url: url, into: &index)
     }
