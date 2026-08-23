@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: macos-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      TRAFFICBAR_GITHUB_REPOSITORY: ${{ github.repository }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify release tag exists
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            echo "::error::Release tag '${RELEASE_TAG}' does not exist. Create and push it first: git tag ${RELEASE_TAG} && git push origin ${RELEASE_TAG}"
+            exit 1
+          fi
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Run tests
+        run: swift test
+
+      - name: Package release assets
+        id: package
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SPARKLE_PRIVATE_KEY:-}" ]]; then
+            echo "::error::SPARKLE_PRIVATE_KEY repository secret is required to build Sparkle appcast.xml"
+            exit 1
+          fi
+          if [[ -z "${SPARKLE_PUBLIC_ED_KEY:-}" ]]; then
+            echo "::error::SPARKLE_PUBLIC_ED_KEY repository secret is required to build the app bundle"
+            exit 1
+          fi
+          arch="$(uname -m)"
+          asset_name="TrafficBar-macos-${arch}"
+          TRAFFICBAR_VERSION="${RELEASE_TAG#v}" scripts/package-release.sh \
+            --appcast-download-url-prefix "https://github.com/${TRAFFICBAR_GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/"
+          echo "tarball=dist/${asset_name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "tarball_checksum=dist/${asset_name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "dmg=dist/${asset_name}.dmg" >> "$GITHUB_OUTPUT"
+          echo "dmg_checksum=dist/${asset_name}.dmg.sha256" >> "$GITHUB_OUTPUT"
+          echo "appcast=dist/appcast.xml" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+          TARBALL_CHECKSUM: ${{ steps.package.outputs.tarball_checksum }}
+          DMG: ${{ steps.package.outputs.dmg }}
+          DMG_CHECKSUM: ${{ steps.package.outputs.dmg_checksum }}
+          APPCAST: ${{ steps.package.outputs.appcast }}
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${TARBALL}" "${TARBALL_CHECKSUM}" "${DMG}" "${DMG_CHECKSUM}" "${APPCAST}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${TARBALL}" "${TARBALL_CHECKSUM}" "${DMG}" "${DMG_CHECKSUM}" "${APPCAST}" \
+              --title "${RELEASE_TAG}" \
+              --generate-notes \
+              --verify-tag
+          fi
