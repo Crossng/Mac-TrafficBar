@@ -1,256 +1,116 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage() {
-  cat <<'EOF'
-Usage:
-  scripts/package-release.sh [options]
-
-Builds TrafficBar.app and packages release artifacts into dist/.
-The app version comes from TRAFFICBAR_VERSION when set, otherwise from VERSION.
-
-Options:
-  --skip-build          Reuse the existing .build/release/TrafficBar executable.
-  --output-dir <path>   Write artifacts to this directory. Defaults to dist.
-  --appcast-download-url-prefix <url>
-                        Generate dist/appcast.xml for Sparkle updates using
-                        SPARKLE_PRIVATE_KEY, SPARKLE_PUBLIC_ED_KEY, and this
-                        release asset URL prefix.
-  -h, --help            Show this help.
-
-Artifacts:
-  TrafficBar-macos-<arch>.dmg
-  TrafficBar-macos-<arch>.dmg.sha256
-  TrafficBar-macos-<arch>.tar.gz
-  TrafficBar-macos-<arch>.tar.gz.sha256
-  appcast.xml when --appcast-download-url-prefix is provided
-EOF
-}
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-SKIP_BUILD=0
-OUTPUT_DIR="dist"
-APPCAST_DOWNLOAD_URL_PREFIX=""
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --skip-build)
-      SKIP_BUILD=1
-      shift
-      ;;
-    --output-dir)
-      [[ $# -ge 2 ]] || die "--output-dir requires a path"
-      OUTPUT_DIR="$2"
-      shift 2
-      ;;
-    --appcast-download-url-prefix)
-      [[ $# -ge 2 ]] || die "--appcast-download-url-prefix requires a URL"
-      APPCAST_DOWNLOAD_URL_PREFIX="$2"
-      shift 2
-      ;;
-    -*)
-      die "unknown option: $1"
-      ;;
-    *)
-      die "unexpected argument: $1"
-      ;;
-  esac
-done
-
-command -v git >/dev/null || die "git is required"
-command -v swift >/dev/null || die "swift is required"
-command -v ditto >/dev/null || die "ditto is required"
-command -v hdiutil >/dev/null || die "hdiutil is required to build a DMG"
-command -v iconutil >/dev/null || die "iconutil is required to build the app icon"
-command -v install_name_tool >/dev/null || die "install_name_tool is required"
-command -v shasum >/dev/null || die "shasum is required"
-command -v sips >/dev/null || die "sips is required to build the app icon"
-
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
-cd "${REPO_ROOT}"
-
-[[ -n "${OUTPUT_DIR}" && "${OUTPUT_DIR}" != "/" ]] || die "refusing to use unsafe output directory: ${OUTPUT_DIR}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 
 APP_NAME="TrafficBar"
-DISPLAY_NAME="流量管家"
+VERSION="${TRAFFICBAR_VERSION:-$(tr -d '[:space:]' < VERSION)}"
 BUNDLE_ID="${TRAFFICBAR_BUNDLE_ID:-com.crossng.TrafficBar}"
-GITHUB_REPOSITORY="${TRAFFICBAR_GITHUB_REPOSITORY:-}"
-EXECUTABLE_PATH=".build/release/${APP_NAME}"
-ICON_SOURCE_PATH="Resources/TrafficBarIcon.png"
-BUILD_PRODUCTS_DIR="$(dirname "${EXECUTABLE_PATH}")"
-SPARKLE_FRAMEWORK_PATH="${BUILD_PRODUCTS_DIR}/Sparkle.framework"
+REPOSITORY="${TRAFFICBAR_GITHUB_REPOSITORY:-}"
+PUBLIC_KEY="${SPARKLE_PUBLIC_ED_KEY:-}"
+BUILD_PRODUCTS_DIR=".build/$(uname -m)-apple-macosx/release"
+SPARKLE_FRAMEWORK="$BUILD_PRODUCTS_DIR/Sparkle.framework"
 SPARKLE_BIN_DIR=".build/artifacts/sparkle/Sparkle/bin"
-VERSION="${TRAFFICBAR_VERSION:-}"
-if [[ -z "${VERSION}" && -f VERSION ]]; then
-  VERSION="$(tr -d '[:space:]' < VERSION)"
-fi
-[[ -n "${VERSION}" ]] || die "missing version; set TRAFFICBAR_VERSION or create VERSION"
-[[ "${VERSION}" =~ ^[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]] || die "version must look like 0.1.0"
+DIST_DIR="$ROOT_DIR/dist"
+APP_DIR="$DIST_DIR/$APP_NAME.app"
+ICON_BASENAME="TrafficBarIcon-$VERSION"
+ICONSET_DIR="$DIST_DIR/$ICON_BASENAME.iconset"
+ICON_FILE="$DIST_DIR/$ICON_BASENAME.icns"
 
-if [[ "${SKIP_BUILD}" != "1" ]]; then
-  swift build -c release
-fi
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-[[ -x "${EXECUTABLE_PATH}" ]] || die "missing release executable at ${EXECUTABLE_PATH}"
-[[ -f "${ICON_SOURCE_PATH}" ]] || die "missing app icon source at ${ICON_SOURCE_PATH}"
-[[ -d "${SPARKLE_FRAMEWORK_PATH}" ]] || die "missing Sparkle framework at ${SPARKLE_FRAMEWORK_PATH}; run swift build -c release first"
+[[ -n "$VERSION" ]] || die "VERSION is empty"
 
-ARCH="$(uname -m)"
-ASSET_NAME="${APP_NAME}-macos-${ARCH}"
-DIST_DIR="${OUTPUT_DIR}"
-APP_BUNDLE="${DIST_DIR}/${APP_NAME}.app"
-CONTENTS_DIR="${APP_BUNDLE}/Contents"
-MACOS_DIR="${CONTENTS_DIR}/MacOS"
-FRAMEWORKS_DIR="${CONTENTS_DIR}/Frameworks"
-RESOURCES_DIR="${CONTENTS_DIR}/Resources"
-TARBALL_PATH="${DIST_DIR}/${ASSET_NAME}.tar.gz"
-DMG_PATH="${DIST_DIR}/${ASSET_NAME}.dmg"
-APPCAST_PATH="${DIST_DIR}/appcast.xml"
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trafficbar-package.XXXXXX")"
+swift build -c release
 
-cleanup() {
-  rm -rf "${WORK_DIR}"
-}
-trap cleanup EXIT
+mkdir -p Resources "$DIST_DIR"
+swiftc scripts/make-icon.swift -o "$DIST_DIR/.make-icon"
+"$DIST_DIR/.make-icon" Resources/TrafficBarIcon.png
 
-rm -rf "${DIST_DIR}"
-mkdir -p "${MACOS_DIR}" "${FRAMEWORKS_DIR}" "${RESOURCES_DIR}"
+rm -rf "$ICONSET_DIR"
+mkdir -p "$ICONSET_DIR"
+sips -z 16 16 Resources/TrafficBarIcon.png --out "$ICONSET_DIR/icon_16x16.png" >/dev/null
+sips -z 32 32 Resources/TrafficBarIcon.png --out "$ICONSET_DIR/icon_16x16@2x.png" >/dev/null
+sips -z 32 32 Resources/TrafficBarIcon.png --out "$ICONSET_DIR/icon_32x32.png" >/dev/null
+sips -z 64 64 Resources/TrafficBarIcon.png --out "$ICONSET_DIR/icon_32x32@2x.png" >/dev/null
+sips -z 128 128 Resources/TrafficBarIcon.png --out "$ICONSET_DIR/icon_128x128.png" >/dev/null
+sips -z 256 256 Resources/TrafficBarIcon.png --out "$ICONSET_DIR/icon_128x128@2x.png" >/dev/null
+sips -z 256 256 Resources/TrafficBarIcon.png --out "$ICONSET_DIR/icon_256x256.png" >/dev/null
+sips -z 512 512 Resources/TrafficBarIcon.png --out "$ICONSET_DIR/icon_256x256@2x.png" >/dev/null
+sips -z 512 512 Resources/TrafficBarIcon.png --out "$ICONSET_DIR/icon_512x512.png" >/dev/null
+cp Resources/TrafficBarIcon.png "$ICONSET_DIR/icon_512x512@2x.png"
+iconutil -c icns "$ICONSET_DIR" -o "$ICON_FILE"
 
-cp "${EXECUTABLE_PATH}" "${MACOS_DIR}/${APP_NAME}"
-chmod +x "${MACOS_DIR}/${APP_NAME}"
-ditto "${SPARKLE_FRAMEWORK_PATH}" "${FRAMEWORKS_DIR}/Sparkle.framework"
-install_name_tool -add_rpath "@executable_path/../Frameworks" "${MACOS_DIR}/${APP_NAME}"
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Frameworks" "$APP_DIR/Contents/Resources"
+cp "$BUILD_PRODUCTS_DIR/$APP_NAME" "$APP_DIR/Contents/MacOS/$APP_NAME"
+ditto "$SPARKLE_FRAMEWORK" "$APP_DIR/Contents/Frameworks/Sparkle.framework"
+cp "$ICON_FILE" "$APP_DIR/Contents/Resources/$ICON_BASENAME.icns"
+cp LICENSE "$APP_DIR/Contents/Resources/LICENSE.txt"
+cp NOTICE.md "$APP_DIR/Contents/Resources/NOTICE.txt"
+cp THIRD-PARTY-NOTICES/README.md "$APP_DIR/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+cp THIRD-PARTY-NOTICES/Sparkle-LICENSE.txt "$APP_DIR/Contents/Resources/Sparkle-LICENSE.txt"
 
-ICONSET_DIR="${WORK_DIR}/${APP_NAME}.iconset"
-mkdir -p "${ICONSET_DIR}"
-sips -z 16 16 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_16x16.png" >/dev/null
-sips -z 32 32 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_16x16@2x.png" >/dev/null
-sips -z 32 32 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_32x32.png" >/dev/null
-sips -z 64 64 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_32x32@2x.png" >/dev/null
-sips -z 128 128 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_128x128.png" >/dev/null
-sips -z 256 256 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_128x128@2x.png" >/dev/null
-sips -z 256 256 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_256x256.png" >/dev/null
-sips -z 512 512 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_256x256@2x.png" >/dev/null
-sips -z 512 512 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_512x512.png" >/dev/null
-sips -z 1024 1024 "${ICON_SOURCE_PATH}" --out "${ICONSET_DIR}/icon_512x512@2x.png" >/dev/null
-iconutil -c icns "${ICONSET_DIR}" -o "${RESOURCES_DIR}/${APP_NAME}.icns"
-
-SPARKLE_PLIST_KEYS=""
-if [[ -n "${GITHUB_REPOSITORY}" ]]; then
-  [[ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]] || die "SPARKLE_PUBLIC_ED_KEY is required when TRAFFICBAR_GITHUB_REPOSITORY is set"
-  SPARKLE_PLIST_KEYS="$(cat <<EOF
-  <key>SUEnableAutomaticChecks</key>
-  <true/>
-  <key>SUFeedURL</key>
-  <string>https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/appcast.xml</string>
-  <key>SUPublicEDKey</key>
-  <string>${SPARKLE_PUBLIC_ED_KEY}</string>
-  <key>SURequireSignedFeed</key>
-  <true/>
-  <key>SUVerifyUpdateBeforeExtraction</key>
-  <true/>
-EOF
-)"
+FEED_URL=""
+if [[ -n "$REPOSITORY" ]]; then
+    FEED_URL="https://github.com/$REPOSITORY/releases/latest/download/appcast.xml"
 fi
 
-cat > "${CONTENTS_DIR}/Info.plist" <<EOF
+cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleDevelopmentRegion</key>
-  <string>zh_CN</string>
-  <key>CFBundleDisplayName</key>
-  <string>${DISPLAY_NAME}</string>
-  <key>CFBundleExecutable</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundleIdentifier</key>
-  <string>${BUNDLE_ID}</string>
-  <key>CFBundleIconFile</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundleInfoDictionaryVersion</key>
-  <string>6.0</string>
-  <key>CFBundleName</key>
-  <string>${APP_NAME}</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
-  <key>CFBundleShortVersionString</key>
-  <string>${VERSION}</string>
-  <key>CFBundleVersion</key>
-  <string>${VERSION}</string>
-  <key>LSMinimumSystemVersion</key>
-  <string>13.0</string>
-  <key>LSUIElement</key>
-  <true/>
-  <key>NSHighResolutionCapable</key>
-  <true/>
-  <key>NSPrincipalClass</key>
-  <string>NSApplication</string>
-${SPARKLE_PLIST_KEYS}
+    <key>CFBundleDisplayName</key><string>流量管家</string>
+    <key>CFBundleExecutable</key><string>$APP_NAME</string>
+    <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
+    <key>CFBundleIconFile</key><string>$ICON_BASENAME.icns</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>流量管家</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
+    <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
+    <key>SUEnableAutomaticChecks</key><true/>
+PLIST
+
+if [[ -n "$FEED_URL" && -n "$PUBLIC_KEY" ]]; then
+    cat >> "$APP_DIR/Contents/Info.plist" <<PLIST
+    <key>SUFeedURL</key><string>$FEED_URL</string>
+    <key>SUPublicEDKey</key><string>$PUBLIC_KEY</string>
+PLIST
+fi
+
+cat >> "$APP_DIR/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
-EOF
+PLIST
 
-if command -v codesign >/dev/null; then
-  codesign --force --deep --sign - "${APP_BUNDLE}" >/dev/null
+install_name_tool -add_rpath '@executable_path/../Frameworks' "$APP_DIR/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+codesign --force --deep --sign - "$APP_DIR" >/dev/null
+
+ARCH="$(uname -m)"
+DMG="$DIST_DIR/${APP_NAME}-macos-${ARCH}.dmg"
+ARCHIVE="$DIST_DIR/${APP_NAME}-macos-${ARCH}.tar.gz"
+STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trafficbar-dmg.XXXXXX")"
+trap 'rm -rf "$STAGE_DIR" "$DIST_DIR/.make-icon" "$ICONSET_DIR"' EXIT
+mkdir -p "$STAGE_DIR"
+ditto "$APP_DIR" "$STAGE_DIR/流量管家.app"
+ln -s /Applications "$STAGE_DIR/应用程序"
+hdiutil create -volname "流量管家" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG" >/dev/null
+tar -czf "$ARCHIVE" -C "$DIST_DIR" "$APP_NAME.app"
+shasum -a 256 "$DMG" | awk '{print $1}' > "$DMG.sha256"
+shasum -a 256 "$ARCHIVE" | awk '{print $1}' > "$ARCHIVE.sha256"
+
+if [[ -n "${SPARKLE_PRIVATE_KEY:-}" && -n "$REPOSITORY" ]]; then
+    [[ -x "$SPARKLE_BIN_DIR/generate_appcast" ]] || die "Sparkle generate_appcast not found"
+    printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SPARKLE_BIN_DIR/generate_appcast" \
+        --ed-key-file - \
+        --download-url-prefix "https://github.com/$REPOSITORY/releases/download/v$VERSION/" \
+        --embed-release-notes "$DIST_DIR"
 fi
 
-tar -czf "${TARBALL_PATH}" -C "${DIST_DIR}" "${APP_NAME}.app"
-
-DMG_ROOT="${WORK_DIR}/dmg-root"
-mkdir -p "${DMG_ROOT}"
-cp -R "${APP_BUNDLE}" "${DMG_ROOT}/"
-ln -s /Applications "${DMG_ROOT}/Applications"
-hdiutil create -volname "${APP_NAME}" -srcfolder "${DMG_ROOT}" -ov -format UDZO "${DMG_PATH}" >/dev/null
-
-checksum() {
-  local artifact="$1"
-  (
-    cd "$(dirname "${artifact}")"
-    shasum -a 256 "$(basename "${artifact}")" > "$(basename "${artifact}").sha256"
-  )
-}
-
-checksum "${TARBALL_PATH}"
-checksum "${DMG_PATH}"
-
-if [[ -n "${APPCAST_DOWNLOAD_URL_PREFIX}" ]]; then
-  [[ -n "${SPARKLE_PRIVATE_KEY:-}" ]] || die "SPARKLE_PRIVATE_KEY is required to generate a Sparkle appcast"
-  [[ -n "${GITHUB_REPOSITORY}" ]] || die "TRAFFICBAR_GITHUB_REPOSITORY is required to generate a Sparkle appcast"
-  [[ -x "${SPARKLE_BIN_DIR}/generate_appcast" ]] || die "missing Sparkle generate_appcast tool at ${SPARKLE_BIN_DIR}/generate_appcast"
-
-  APPCAST_WORK_DIR="${WORK_DIR}/appcast"
-  mkdir -p "${APPCAST_WORK_DIR}"
-  cp "${DMG_PATH}" "${APPCAST_WORK_DIR}/"
-  cat > "${APPCAST_WORK_DIR}/${ASSET_NAME}.md" <<EOF
-# TrafficBar ${VERSION}
-
-See the GitHub release for the full changelog.
-EOF
-
-  printf '%s' "${SPARKLE_PRIVATE_KEY}" | "${SPARKLE_BIN_DIR}/generate_appcast" \
-    --ed-key-file - \
-    --download-url-prefix "${APPCAST_DOWNLOAD_URL_PREFIX%/}/" \
-    --link "https://github.com/${GITHUB_REPOSITORY}" \
-    --embed-release-notes \
-    --maximum-versions 1 \
-    -o "${APPCAST_PATH}" \
-    "${APPCAST_WORK_DIR}" >/dev/null
-fi
-
-echo "Packaged release artifacts:"
-echo "  ${TARBALL_PATH}"
-echo "  ${TARBALL_PATH}.sha256"
-echo "  ${DMG_PATH}"
-echo "  ${DMG_PATH}.sha256"
-if [[ -f "${APPCAST_PATH}" ]]; then
-  echo "  ${APPCAST_PATH}"
-fi
+printf 'Built %s\n' "$APP_DIR"
+printf 'DMG: %s\n' "$DMG"

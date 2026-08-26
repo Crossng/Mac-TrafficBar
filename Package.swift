@@ -3,20 +3,19 @@
 import PackageDescription
 
 let package = Package(
-    name: "TrafficBar",
+    name: "BandwidthDesk",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .library(name: "TrafficBarCore", targets: ["TrafficBarCore"]),
         .executable(name: "TrafficBar", targets: ["TrafficBar"])
     ],
     dependencies: [
-        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.1")
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.1")
     ],
     targets: [
         .target(
-            name: "TrafficBarCore",
+            name: "BandwidthEngine",
             linkerSettings: [
                 .linkedFramework("SystemConfiguration")
             ]
@@ -24,7 +23,7 @@ let package = Package(
         .executableTarget(
             name: "TrafficBar",
             dependencies: [
-                "TrafficBarCore",
+                "BandwidthEngine",
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             linkerSettings: [
@@ -32,8 +31,8 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "TrafficBarCoreTests",
-            dependencies: ["TrafficBarCore"]
+            name: "BandwidthEngineTests",
+            dependencies: ["BandwidthEngine"]
         )
     ]
 )

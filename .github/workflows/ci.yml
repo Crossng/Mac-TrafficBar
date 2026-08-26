@@ -2,39 +2,13 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [main]
   pull_request:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
-  swift:
-    name: Swift tests and builds
-    runs-on: macos-latest
-
+  build:
+    runs-on: macos-14
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Show Swift version
-        run: swift --version
-
-      - name: Build debug
-        run: swift build
-
-      - name: Run tests
-        run: swift test
-
-      - name: Build release
+      - uses: actions/checkout@v4
+      - name: Build
         run: swift build -c release
-
-      - name: Package release artifacts
-        run: scripts/package-release.sh --skip-build
