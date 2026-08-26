@@ -1,11 +1,40 @@
 import Foundation
 import SystemConfiguration
 
-public struct ProxySettings {
-    public let ports: Set<Int>
+public struct ProxyEndpoint: Hashable, Sendable {
+    public let host: String?
+    public let port: Int
 
-    public init(ports: Set<Int> = []) {
-        self.ports = ports
+    public init(host: String?, port: Int) {
+        let normalized = host?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        self.host = normalized?.isEmpty == true ? nil : normalized
+        self.port = port
+    }
+}
+
+public struct ProxySettings: Sendable {
+    public let endpoints: Set<ProxyEndpoint>
+
+    public init(endpoints: Set<ProxyEndpoint> = []) {
+        self.endpoints = endpoints
+    }
+
+    public func matches(_ endpoint: NetworkEndpoint) -> Bool {
+        guard let port = endpoint.port else { return false }
+        let endpointHost = endpoint.host.lowercased()
+
+        return endpoints.contains { proxy in
+            guard proxy.port == port else { return false }
+            guard let proxyHost = proxy.host else { return endpoint.isLoopback }
+
+            let normalizedProxyHost = proxyHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            if normalizedProxyHost == "localhost" || normalizedProxyHost == "::1" || normalizedProxyHost.hasPrefix("127.") {
+                return endpoint.isLoopback
+            }
+            return normalizedProxyHost == endpointHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        }
     }
 
     public static func current() -> ProxySettings {
@@ -13,22 +42,45 @@ public struct ProxySettings {
             return ProxySettings()
         }
 
-        var ports = Set<Int>()
-        let candidates: [(CFString, CFString)] = [
-            (kSCPropNetProxiesHTTPEnable, kSCPropNetProxiesHTTPPort),
-            (kSCPropNetProxiesHTTPSEnable, kSCPropNetProxiesHTTPSPort),
-            (kSCPropNetProxiesFTPEnable, kSCPropNetProxiesFTPPort),
-            (kSCPropNetProxiesSOCKSEnable, kSCPropNetProxiesSOCKSPort)
+        var endpoints = Set<ProxyEndpoint>()
+        let candidates: [(CFString, CFString, CFString)] = [
+            (kSCPropNetProxiesHTTPEnable, kSCPropNetProxiesHTTPProxy, kSCPropNetProxiesHTTPPort),
+            (kSCPropNetProxiesHTTPSEnable, kSCPropNetProxiesHTTPSProxy, kSCPropNetProxiesHTTPSPort),
+            (kSCPropNetProxiesFTPEnable, kSCPropNetProxiesFTPProxy, kSCPropNetProxiesFTPPort),
+            (kSCPropNetProxiesSOCKSEnable, kSCPropNetProxiesSOCKSProxy, kSCPropNetProxiesSOCKSPort)
         ]
 
-        for (enabledKey, portKey) in candidates {
+        for (enabledKey, hostKey, portKey) in candidates {
             let enabled = (dictionary[enabledKey as String] as? NSNumber)?.boolValue ?? false
+            let host = dictionary[hostKey as String] as? String
             let port = (dictionary[portKey as String] as? NSNumber)?.intValue ?? 0
             if enabled, port > 0 {
-                ports.insert(port)
+                endpoints.insert(ProxyEndpoint(host: host, port: port))
             }
         }
 
-        return ProxySettings(ports: ports)
+        return ProxySettings(endpoints: endpoints)
+    }
+}
+
+public struct RouteClassifier: Sendable {
+    public let proxySettings: ProxySettings
+
+    public init(proxySettings: ProxySettings) {
+        self.proxySettings = proxySettings
+    }
+
+    public func classify(_ connection: ConnectionSnapshot) -> TrafficPath {
+        let identity = connection.identity
+
+        if proxySettings.matches(identity.local) || proxySettings.matches(identity.remote) {
+            return .proxy
+        }
+
+        if identity.local.isLoopback || identity.remote.isLoopback || identity.interfaceName.lowercased() == "lo0" {
+            return .local
+        }
+
+        return .direct
     }
 }

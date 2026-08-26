@@ -16,7 +16,7 @@ public final class DeltaCalculator: @unchecked Sendable {
     private struct Previous {
         let time: Date
         let total: BytePair
-        let paths: [TrafficPath: BytePair]
+        let connections: [ConnectionIdentity: ConnectionSnapshot]
     }
 
     private let lock = NSLock()
@@ -24,53 +24,124 @@ public final class DeltaCalculator: @unchecked Sendable {
 
     public init() {}
 
-    public func consume(_ snapshots: [ProcessSnapshot], at time: Date = Date()) -> SampleResult {
+    public func consume(
+        _ snapshots: [ProcessSnapshot],
+        proxySettings: ProxySettings,
+        at time: Date = Date()
+    ) -> SampleResult {
         lock.lock()
         defer { lock.unlock() }
 
+        let classifier = RouteClassifier(proxySettings: proxySettings)
         var deltas: [TrafficDelta] = []
         var rates: [String: BytePair] = [:]
         var activeKeys = Set<String>()
 
         for snapshot in snapshots {
-            let key = "\(snapshot.name)#\(snapshot.pid)"
+            let key = snapshot.identity.key
             activeKeys.insert(key)
-            let old = previous[key]
-            let elapsed = max(time.timeIntervalSince(old?.time ?? time), 1)
-            let deltaPaths = Self.deltaPaths(current: snapshot.byPath, previous: old?.paths)
-            let delta = TrafficDelta(key: snapshot.name, name: snapshot.name, pid: snapshot.pid, bytes: deltaPaths)
-            if deltaPaths.values.contains(where: { $0.total > 0 }) {
-                deltas.append(delta)
+            let connections = mergedConnections(snapshot.connections)
+
+            guard let old = previous[key] else {
+                previous[key] = Previous(time: time, total: snapshot.total, connections: connections)
+                continue
             }
 
-            let rate = BytePair(
-                downloaded: UInt64(Double(Self.delta(current: snapshot.total.downloaded, previous: old?.total.downloaded)) / elapsed),
-                uploaded: UInt64(Double(Self.delta(current: snapshot.total.uploaded, previous: old?.total.uploaded)) / elapsed)
-            )
-            rates[snapshot.name, default: BytePair()].add(rate)
-            previous[key] = Previous(time: time, total: snapshot.total, paths: snapshot.byPath)
+            guard let processBudget = snapshot.total.delta(from: old.total) else {
+                previous[key] = Previous(time: time, total: snapshot.total, connections: connections)
+                continue
+            }
+
+            var remaining = processBudget
+            var acceptedByPath: [TrafficPath: BytePair] = [:]
+            var currentHints: [TrafficPath: BytePair] = [:]
+            var fallbackHints: [TrafficPath: BytePair] = [:]
+
+            for connection in connections.values where connection.bytes.total > 0 {
+                let path = classifier.classify(connection)
+                currentHints[path, default: BytePair()].add(connection.bytes)
+
+                guard let previousConnection = old.connections[connection.identity],
+                      let rawDelta = connection.bytes.delta(from: previousConnection.bytes) else {
+                    fallbackHints[path, default: BytePair()].add(connection.bytes)
+                    continue
+                }
+
+                let accepted = rawDelta.capped(to: remaining)
+                guard accepted.total > 0 else { continue }
+                acceptedByPath[path, default: BytePair()].add(accepted)
+                remaining.subtract(accepted)
+            }
+
+            for (identity, oldConnection) in old.connections where connections[identity] == nil && oldConnection.bytes.total > 0 {
+                let path = classifier.classify(oldConnection)
+                fallbackHints[path, default: BytePair()].add(oldConnection.bytes)
+            }
+
+            if remaining.total > 0 {
+                let fallbackPath = dominantPath(in: fallbackHints)
+                    ?? dominantPath(in: currentHints)
+                    ?? .direct
+                acceptedByPath[fallbackPath, default: BytePair()].add(remaining)
+            }
+
+            let acceptedTotal = acceptedByPath.values.reduce(into: BytePair()) { $0.add($1) }
+            if acceptedTotal.total > 0 {
+                deltas.append(
+                    TrafficDelta(
+                        key: snapshot.name,
+                        name: snapshot.name,
+                        pid: snapshot.pid,
+                        bytes: acceptedByPath
+                    )
+                )
+
+                let elapsed = max(time.timeIntervalSince(old.time), 1)
+                let rate = BytePair(
+                    downloaded: UInt64(Double(acceptedTotal.downloaded) / elapsed),
+                    uploaded: UInt64(Double(acceptedTotal.uploaded) / elapsed)
+                )
+                rates[snapshot.name, default: BytePair()].add(rate)
+            }
+
+            previous[key] = Previous(time: time, total: snapshot.total, connections: connections)
         }
 
         previous = previous.filter { activeKeys.contains($0.key) }
         return SampleResult(deltas: deltas, rates: rates, timestamp: time)
     }
 
-    private static func deltaPaths(current: [TrafficPath: BytePair], previous: [TrafficPath: BytePair]?) -> [TrafficPath: BytePair] {
-        var output: [TrafficPath: BytePair] = [:]
-        for path in TrafficPath.allCases {
-            let currentValue = current[path] ?? BytePair()
-            let previousValue = previous?[path] ?? BytePair()
-            let value = BytePair(
-                downloaded: delta(current: currentValue.downloaded, previous: previousValue.downloaded),
-                uploaded: delta(current: currentValue.uploaded, previous: previousValue.uploaded)
-            )
-            if value.total > 0 { output[path] = value }
-        }
-        return output
+    private func dominantPath(in hints: [TrafficPath: BytePair]) -> TrafficPath? {
+        hints
+            .filter { $0.value.total > 0 }
+            .max { lhs, rhs in
+                if lhs.value.total == rhs.value.total {
+                    return priority(lhs.key) < priority(rhs.key)
+                }
+                return lhs.value.total < rhs.value.total
+            }?
+            .key
     }
 
-    private static func delta(current: UInt64, previous: UInt64?) -> UInt64 {
-        guard let previous else { return 0 }
-        return current >= previous ? current - previous : 0
+    private func priority(_ path: TrafficPath) -> Int {
+        switch path {
+        case .proxy: return 3
+        case .direct: return 2
+        case .local: return 1
+        }
+    }
+
+    private func mergedConnections(_ snapshots: [ConnectionSnapshot]) -> [ConnectionIdentity: ConnectionSnapshot] {
+        var merged: [ConnectionIdentity: ConnectionSnapshot] = [:]
+        for snapshot in snapshots {
+            if let existing = merged[snapshot.identity] {
+                var bytes = existing.bytes
+                bytes.add(snapshot.bytes)
+                merged[snapshot.identity] = ConnectionSnapshot(identity: snapshot.identity, bytes: bytes)
+            } else {
+                merged[snapshot.identity] = snapshot
+            }
+        }
+        return merged
     }
 }

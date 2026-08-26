@@ -67,7 +67,11 @@ private final class MonitorSession {
                         self.icons[snapshot.name] = icon
                     }
                 }
-                let sample = self.calculator.consume(snapshots, at: now)
+                let sample = self.calculator.consume(
+                    snapshots,
+                    proxySettings: ProxySettings.current(),
+                    at: now
+                )
                 self.ledger.record(sample.deltas, at: now)
                 self.rates = sample.rates
                 self.lastUpdated = now
@@ -597,7 +601,8 @@ private final class DashboardViewController: NSViewController {
         actions.setCustomSpacing(8, after: folder)
         actions.setCustomSpacing(8, after: divider)
 
-        let version = NSTextField(labelWithString: "TrafficBar 0.2.0")
+        let versionNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.1"
+        let version = NSTextField(labelWithString: "TrafficBar \(versionNumber)")
         version.textColor = .tertiaryLabelColor
         version.font = .systemFont(ofSize: 10.5, weight: .medium)
         let spacer = NSView()
@@ -682,8 +687,7 @@ private final class DashboardViewController: NSViewController {
 
 private extension TrafficLedger {
     var ledgerDirectoryURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("TrafficBar", isDirectory: true)
+        storageDirectoryURL
     }
 }
 

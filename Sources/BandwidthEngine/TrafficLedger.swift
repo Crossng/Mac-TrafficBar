@@ -10,24 +10,35 @@ public final class TrafficLedger: @unchecked Sendable {
         var entries: [String: StoredEntry]
     }
 
-    private struct RecentDelta {
+    private struct RecentDelta: Codable {
         let date: Date
         let key: String
         let name: String
         let paths: [TrafficPath: BytePair]
     }
 
-    private let directoryURL: URL
+    public let storageDirectoryURL: URL
     private let calendar: Calendar
     private let lock = NSLock()
-    private var recent: [RecentDelta] = []
+    private let recentEncoder: JSONEncoder
+    private let recentDecoder: JSONDecoder
+    private var recent: [RecentDelta]
 
     public init(directoryURL: URL? = nil, calendar: Calendar = .current) throws {
         self.calendar = calendar
-        self.directoryURL = directoryURL ?? FileManager.default
+        self.storageDirectoryURL = directoryURL ?? FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TrafficBar", isDirectory: true)
-        try FileManager.default.createDirectory(at: self.directoryURL, withIntermediateDirectories: true)
+            .appendingPathComponent("engine-v2", isDirectory: true)
+        self.recentEncoder = JSONEncoder()
+        self.recentDecoder = JSONDecoder()
+        self.recent = []
+        recentEncoder.dateEncodingStrategy = .iso8601
+        recentDecoder.dateDecodingStrategy = .iso8601
+
+        try FileManager.default.createDirectory(at: storageDirectoryURL, withIntermediateDirectories: true)
+        loadRecent(referenceDate: Date())
+        removeStaleFiles(referenceDate: Date())
     }
 
     public func record(_ deltas: [TrafficDelta], at date: Date = Date()) {
@@ -37,6 +48,7 @@ public final class TrafficLedger: @unchecked Sendable {
 
         let dayID = dayIdentifier(for: date)
         var day = loadDay(dayID)
+        var events: [RecentDelta] = []
 
         for delta in deltas {
             var entry = day.entries[delta.key] ?? StoredEntry(name: delta.name, paths: [:])
@@ -45,12 +57,17 @@ public final class TrafficLedger: @unchecked Sendable {
                 entry.paths[path, default: BytePair()].add(bytes)
             }
             day.entries[delta.key] = entry
-            recent.append(RecentDelta(date: date, key: delta.key, name: delta.name, paths: delta.bytes))
+
+            let event = RecentDelta(date: date, key: delta.key, name: delta.name, paths: delta.bytes)
+            recent.append(event)
+            events.append(event)
         }
 
-        recent.removeAll { $0.date < date.addingTimeInterval(-3600) }
+        let cutoff = date.addingTimeInterval(-3600)
+        recent.removeAll { $0.date < cutoff }
         saveDay(day, identifier: dayID)
-        removeStaleDays(olderThan: 62, referenceDate: date)
+        appendRecent(events, identifier: dayID)
+        removeStaleFiles(referenceDate: date)
     }
 
     public func summaries(window: TimeWindow, filter: FlowFilter, at date: Date = Date()) -> [ApplicationSummary] {
@@ -62,12 +79,11 @@ public final class TrafficLedger: @unchecked Sendable {
         case .hour:
             let cutoff = date.addingTimeInterval(-3600)
             entries = recent
-                .filter { $0.date >= cutoff }
+                .filter { $0.date >= cutoff && $0.date <= date }
                 .map { ($0.key, $0.name, $0.paths) }
         case .today, .week, .month:
             let start = startDate(for: window, referenceDate: date)
-            let identifiers = dayIdentifiers(from: start, through: date)
-            entries = identifiers.flatMap { identifier in
+            entries = dayIdentifiers(from: start, through: date).flatMap { identifier in
                 loadDay(identifier).entries.map { ($0.key, $0.value.name, $0.value.paths) }
             }
         }
@@ -85,7 +101,9 @@ public final class TrafficLedger: @unchecked Sendable {
         return grouped.map { ApplicationSummary(id: $0.key, name: $0.value.name, bytes: $0.value.paths) }
             .filter { $0.total.total > 0 }
             .sorted { lhs, rhs in
-                if lhs.total.total == rhs.total.total { return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending }
+                if lhs.total.total == rhs.total.total {
+                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                }
                 return lhs.total.total > rhs.total.total
             }
     }
@@ -95,8 +113,50 @@ public final class TrafficLedger: @unchecked Sendable {
             .reduce(into: BytePair()) { $0.add($1.total) }
     }
 
+    private func appendRecent(_ events: [RecentDelta], identifier: String) {
+        guard !events.isEmpty else { return }
+        let url = recentFileURL(for: identifier)
+
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? Data().write(to: url, options: .atomic)
+        }
+
+        guard let handle = try? FileHandle(forWritingTo: url) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+
+        for event in events {
+            guard var data = try? recentEncoder.encode(event) else { continue }
+            data.append(0x0A)
+            try? handle.write(contentsOf: data)
+        }
+    }
+
+    private func loadRecent(referenceDate: Date) {
+        let start = calendar.date(byAdding: .day, value: -1, to: referenceDate) ?? referenceDate
+        let cutoff = referenceDate.addingTimeInterval(-3600)
+
+        recent = dayIdentifiers(from: start, through: referenceDate).flatMap { identifier -> [RecentDelta] in
+            let url = recentFileURL(for: identifier)
+            guard let data = try? Data(contentsOf: url),
+                  let text = String(data: data, encoding: .utf8) else {
+                return []
+            }
+
+            return text.split(whereSeparator: \.isNewline).compactMap { line in
+                guard let data = String(line).data(using: .utf8),
+                      let event = try? recentDecoder.decode(RecentDelta.self, from: data),
+                      event.date >= cutoff,
+                      event.date <= referenceDate else {
+                    return nil
+                }
+                return event
+            }
+        }
+    }
+
     private func dayIdentifier(for date: Date) -> String {
-        Self.formatter.string(from: calendar.startOfDay(for: date))
+        Self.dayFormatter.string(from: calendar.startOfDay(for: date))
     }
 
     private func startDate(for window: TimeWindow, referenceDate: Date) -> Date {
@@ -116,19 +176,23 @@ public final class TrafficLedger: @unchecked Sendable {
         var cursor = calendar.startOfDay(for: start)
         let final = calendar.startOfDay(for: end)
         while cursor <= final {
-            output.append(Self.formatter.string(from: cursor))
+            output.append(dayIdentifier(for: cursor))
             guard let next = calendar.date(byAdding: .day, value: 1, to: cursor) else { break }
             cursor = next
         }
         return output
     }
 
-    private func fileURL(for identifier: String) -> URL {
-        directoryURL.appendingPathComponent("day-\(identifier).json")
+    private func dayFileURL(for identifier: String) -> URL {
+        storageDirectoryURL.appendingPathComponent("day-\(identifier).json")
+    }
+
+    private func recentFileURL(for identifier: String) -> URL {
+        storageDirectoryURL.appendingPathComponent("recent-\(identifier).jsonl")
     }
 
     private func loadDay(_ identifier: String) -> DayFile {
-        guard let data = try? Data(contentsOf: fileURL(for: identifier)),
+        guard let data = try? Data(contentsOf: dayFileURL(for: identifier)),
               let value = try? JSONDecoder().decode(DayFile.self, from: data) else {
             return DayFile(entries: [:])
         }
@@ -136,34 +200,47 @@ public final class TrafficLedger: @unchecked Sendable {
     }
 
     private func saveDay(_ day: DayFile, identifier: String) {
-        guard let data = try? JSONEncoder.pretty.encode(day) else { return }
-        try? data.write(to: fileURL(for: identifier), options: .atomic)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(day) else { return }
+        try? data.write(to: dayFileURL(for: identifier), options: .atomic)
     }
 
-    private func removeStaleDays(olderThan days: Int, referenceDate: Date) {
-        let cutoff = calendar.date(byAdding: .day, value: -days, to: referenceDate) ?? referenceDate
-        guard let files = try? FileManager.default.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: [.creationDateKey]) else { return }
-        for file in files where file.lastPathComponent.hasPrefix("day-") && file.pathExtension == "json" {
-            guard let date = Self.dateFormatter.date(from: String(file.deletingPathExtension().lastPathComponent.dropFirst(4))) else { continue }
-            if date < cutoff { try? FileManager.default.removeItem(at: file) }
+    private func removeStaleFiles(referenceDate: Date) {
+        let dayCutoff = calendar.date(byAdding: .day, value: -62, to: referenceDate) ?? referenceDate
+        let recentCutoff = calendar.date(byAdding: .day, value: -2, to: referenceDate) ?? referenceDate
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: storageDirectoryURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for file in files {
+            let name = file.deletingPathExtension().lastPathComponent
+            let cutoff: Date
+            let dateText: String
+
+            if name.hasPrefix("day-") {
+                cutoff = dayCutoff
+                dateText = String(name.dropFirst(4))
+            } else if name.hasPrefix("recent-") {
+                cutoff = recentCutoff
+                dateText = String(name.dropFirst(7))
+            } else {
+                continue
+            }
+
+            guard let fileDate = Self.dayFormatter.date(from: dateText), fileDate < cutoff else { continue }
+            try? FileManager.default.removeItem(at: file)
         }
     }
 
-    private static let formatter: DateFormatter = {
+    private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter
     }()
-
-    private static let dateFormatter = formatter
-}
-
-private extension JSONEncoder {
-    static var pretty: JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return encoder
-    }
 }

@@ -8,7 +8,8 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "TrafficBar", targets: ["TrafficBar"])
+        .executable(name: "TrafficBar", targets: ["TrafficBar"]),
+        .executable(name: "BandwidthEngineVerifier", targets: ["BandwidthEngineVerifier"])
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.1")
@@ -30,8 +31,8 @@ let package = Package(
                 .linkedFramework("AppKit")
             ]
         ),
-        .testTarget(
-            name: "BandwidthEngineTests",
+        .executableTarget(
+            name: "BandwidthEngineVerifier",
             dependencies: ["BandwidthEngine"]
         )
     ]

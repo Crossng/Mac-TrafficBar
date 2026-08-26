@@ -71,26 +71,119 @@ public struct BytePair: Codable, Equatable, Sendable {
         uploaded = uploaded &+ other.uploaded
     }
 
-    public func subtracting(_ other: BytePair) -> BytePair {
-        BytePair(
-            downloaded: downloaded >= other.downloaded ? downloaded - other.downloaded : 0,
-            uploaded: uploaded >= other.uploaded ? uploaded - other.uploaded : 0
+    public func delta(from previous: BytePair) -> BytePair? {
+        guard downloaded >= previous.downloaded, uploaded >= previous.uploaded else {
+            return nil
+        }
+        return BytePair(
+            downloaded: downloaded - previous.downloaded,
+            uploaded: uploaded - previous.uploaded
         )
+    }
+
+    public func capped(to limit: BytePair) -> BytePair {
+        BytePair(
+            downloaded: min(downloaded, limit.downloaded),
+            uploaded: min(uploaded, limit.uploaded)
+        )
+    }
+
+    public mutating func subtract(_ other: BytePair) {
+        downloaded -= min(downloaded, other.downloaded)
+        uploaded -= min(uploaded, other.uploaded)
+    }
+}
+
+public struct ProcessIdentity: Hashable, Sendable {
+    public let name: String
+    public let pid: Int32
+
+    public init(name: String, pid: Int32) {
+        self.name = name
+        self.pid = pid
+    }
+
+    public var key: String { "\(name)#\(pid)" }
+}
+
+public struct NetworkEndpoint: Hashable, Sendable {
+    public let rawValue: String
+    public let host: String
+    public let port: Int?
+
+    public init(rawValue: String) {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.rawValue = trimmed
+        let parsed = Self.parse(trimmed)
+        self.host = parsed.host
+        self.port = parsed.port
+    }
+
+    public var isLoopback: Bool {
+        let value = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        return value == "localhost"
+            || value == "::1"
+            || value == "0:0:0:0:0:0:0:1"
+            || value.hasPrefix("127.")
+    }
+
+    public var isWildcard: Bool { host.isEmpty || host == "*" }
+
+    private static func parse(_ raw: String) -> (host: String, port: Int?) {
+        guard !raw.isEmpty else { return ("", nil) }
+
+        if let colon = raw.lastIndex(of: ":"),
+           let port = Int(raw[raw.index(after: colon)...]) {
+            return (String(raw[..<colon]), port)
+        }
+
+        if (raw.contains(":") || raw.contains("%")),
+           let dot = raw.lastIndex(of: "."),
+           let port = Int(raw[raw.index(after: dot)...]) {
+            return (String(raw[..<dot]), port)
+        }
+
+        return (raw, nil)
+    }
+}
+
+public struct ConnectionIdentity: Hashable, Sendable {
+    public let protocolName: String
+    public let local: NetworkEndpoint
+    public let remote: NetworkEndpoint
+    public let interfaceName: String
+
+    public init(protocolName: String, local: NetworkEndpoint, remote: NetworkEndpoint, interfaceName: String) {
+        self.protocolName = protocolName
+        self.local = local
+        self.remote = remote
+        self.interfaceName = interfaceName
+    }
+}
+
+public struct ConnectionSnapshot: Equatable, Sendable {
+    public let identity: ConnectionIdentity
+    public let bytes: BytePair
+
+    public init(identity: ConnectionIdentity, bytes: BytePair) {
+        self.identity = identity
+        self.bytes = bytes
     }
 }
 
 public struct ProcessSnapshot: Equatable, Sendable {
-    public let name: String
-    public let pid: Int32
+    public let identity: ProcessIdentity
     public let total: BytePair
-    public let byPath: [TrafficPath: BytePair]
+    public let connections: [ConnectionSnapshot]
 
-    public init(name: String, pid: Int32, total: BytePair, byPath: [TrafficPath: BytePair]) {
-        self.name = name
-        self.pid = pid
+    public init(identity: ProcessIdentity, total: BytePair, connections: [ConnectionSnapshot]) {
+        self.identity = identity
         self.total = total
-        self.byPath = byPath
+        self.connections = connections
     }
+
+    public var name: String { identity.name }
+    public var pid: Int32 { identity.pid }
 }
 
 public struct TrafficDelta: Equatable, Sendable {
@@ -104,6 +197,10 @@ public struct TrafficDelta: Equatable, Sendable {
         self.name = name
         self.pid = pid
         self.bytes = bytes
+    }
+
+    public var total: BytePair {
+        bytes.values.reduce(into: BytePair()) { $0.add($1) }
     }
 }
 
@@ -119,6 +216,6 @@ public struct ApplicationSummary: Identifiable, Equatable, Sendable {
     }
 
     public var total: BytePair {
-        bytes.values.reduce(into: BytePair()) { result, value in result.add(value) }
+        bytes.values.reduce(into: BytePair()) { $0.add($1) }
     }
 }
