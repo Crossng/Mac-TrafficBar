@@ -95,7 +95,8 @@ ARCH="$(uname -m)"
 DMG="$DIST_DIR/${APP_NAME}-macos-${ARCH}.dmg"
 ARCHIVE="$DIST_DIR/${APP_NAME}-macos-${ARCH}.tar.gz"
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trafficbar-dmg.XXXXXX")"
-trap 'rm -rf "$STAGE_DIR" "$DIST_DIR/.make-icon" "$ICONSET_DIR"' EXIT
+APPCAST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trafficbar-appcast.XXXXXX")"
+trap 'rm -rf "$STAGE_DIR" "$APPCAST_DIR" "$DIST_DIR/.make-icon" "$ICONSET_DIR"' EXIT
 mkdir -p "$STAGE_DIR"
 ditto "$APP_DIR" "$STAGE_DIR/流量管家.app"
 ln -s /Applications "$STAGE_DIR/应用程序"
@@ -106,10 +107,13 @@ shasum -a 256 "$ARCHIVE" | awk '{print $1}' > "$ARCHIVE.sha256"
 
 if [[ -n "${SPARKLE_PRIVATE_KEY:-}" && -n "$REPOSITORY" ]]; then
     [[ -x "$SPARKLE_BIN_DIR/generate_appcast" ]] || die "Sparkle generate_appcast not found"
+    cp "$DMG" "$APPCAST_DIR/"
     printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SPARKLE_BIN_DIR/generate_appcast" \
         --ed-key-file - \
         --download-url-prefix "https://github.com/$REPOSITORY/releases/download/v$VERSION/" \
-        --embed-release-notes "$DIST_DIR"
+        --embed-release-notes \
+        -o "$DIST_DIR/appcast.xml" \
+        "$APPCAST_DIR"
 fi
 
 printf 'Built %s\n' "$APP_DIR"
