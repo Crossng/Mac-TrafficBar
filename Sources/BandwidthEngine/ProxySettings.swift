@@ -38,11 +38,13 @@ public struct ProxySettings: Sendable {
     }
 
     public static func current() -> ProxySettings {
+        // Some TUN clients keep a local listener active even when the macOS
+        // system proxy switches are off.
+        var endpoints: Set<ProxyEndpoint> = [ProxyEndpoint(host: "127.0.0.1", port: 7897)]
         guard let dictionary = SCDynamicStoreCopyProxies(nil) as NSDictionary? else {
-            return ProxySettings()
+            return ProxySettings(endpoints: endpoints)
         }
 
-        var endpoints = Set<ProxyEndpoint>()
         let candidates: [(CFString, CFString, CFString)] = [
             (kSCPropNetProxiesHTTPEnable, kSCPropNetProxiesHTTPProxy, kSCPropNetProxiesHTTPPort),
             (kSCPropNetProxiesHTTPSEnable, kSCPropNetProxiesHTTPSProxy, kSCPropNetProxiesHTTPSPort),

@@ -186,6 +186,16 @@ public struct ProcessSnapshot: Equatable, Sendable {
     public var pid: Int32 { identity.pid }
 }
 
+public struct NetworkSample: Equatable, Sendable {
+    public let processes: [ProcessSnapshot]
+    public let interfaceTotals: [String: BytePair]
+
+    public init(processes: [ProcessSnapshot], interfaceTotals: [String: BytePair]) {
+        self.processes = processes
+        self.interfaceTotals = interfaceTotals
+    }
+}
+
 public struct TrafficDelta: Equatable, Sendable {
     public let key: String
     public let name: String

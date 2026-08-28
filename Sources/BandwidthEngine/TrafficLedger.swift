@@ -29,7 +29,7 @@ public final class TrafficLedger: @unchecked Sendable {
         self.storageDirectoryURL = directoryURL ?? FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TrafficBar", isDirectory: true)
-            .appendingPathComponent("engine-v2", isDirectory: true)
+            .appendingPathComponent("engine-v3", isDirectory: true)
         self.recentEncoder = JSONEncoder()
         self.recentDecoder = JSONDecoder()
         self.recent = []

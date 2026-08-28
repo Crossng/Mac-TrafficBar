@@ -12,6 +12,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Verify traffic accounting
+        run: swift run -c release BandwidthEngineVerifier
       - name: Build and package
         env:
           TRAFFICBAR_VERSION: ${{ github.ref_name }}

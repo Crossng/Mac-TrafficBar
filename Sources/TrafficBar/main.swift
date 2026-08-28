@@ -60,15 +60,16 @@ private final class MonitorSession {
             self.sampling = false
 
             switch result {
-            case let .success(snapshots):
+            case let .success(networkSample):
                 let now = Date()
-                for snapshot in snapshots {
+                for snapshot in networkSample.processes {
                     if let icon = NSRunningApplication(processIdentifier: snapshot.pid)?.icon {
                         self.icons[snapshot.name] = icon
                     }
                 }
                 let sample = self.calculator.consume(
-                    snapshots,
+                    networkSample.processes,
+                    interfaceTotals: networkSample.interfaceTotals,
                     proxySettings: ProxySettings.current(),
                     at: now
                 )
@@ -601,7 +602,7 @@ private final class DashboardViewController: NSViewController {
         actions.setCustomSpacing(8, after: folder)
         actions.setCustomSpacing(8, after: divider)
 
-        let versionNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.1"
+        let versionNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0"
         let version = NSTextField(labelWithString: "TrafficBar \(versionNumber)")
         version.textColor = .tertiaryLabelColor
         version.font = .systemFont(ofSize: 10.5, weight: .medium)

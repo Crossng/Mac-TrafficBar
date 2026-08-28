@@ -10,6 +10,10 @@ private func expect(_ condition: @autoclosure () -> Bool, _ message: String) thr
     guard condition() else { throw VerificationFailure(description: message) }
 }
 
+private func total(of result: SampleResult) -> BytePair {
+    result.deltas.reduce(into: BytePair()) { $0.add($1.total) }
+}
+
 private func connection(
     protocolName: String = "tcp4",
     local: String,
@@ -132,6 +136,192 @@ private func runVerification() throws {
     try expect(reset.deltas.isEmpty, "计数器回退时必须重新建立基线")
     print("✓ PID/计数器回退保护")
 
+    let globalCapCalculator = DeltaCalculator()
+    let capBaseline = [
+        snapshot(
+            name: "Browser", pid: 101, downloaded: 100_000, uploaded: 50_000,
+            connections: [connection(local: "10.0.0.2:5001", remote: "8.8.8.8:443", interface: "en0", downloaded: 100_000, uploaded: 50_000)]
+        ),
+        snapshot(
+            name: "Downloader", pid: 102, downloaded: 100_000, uploaded: 50_000,
+            connections: [connection(local: "10.0.0.2:5002", remote: "1.1.1.1:443", interface: "en0", downloaded: 100_000, uploaded: 50_000)]
+        )
+    ]
+    let capNext = [
+        snapshot(
+            name: "Browser", pid: 101, downloaded: 200_000, uploaded: 100_000,
+            connections: [connection(local: "10.0.0.2:5001", remote: "8.8.8.8:443", interface: "en0", downloaded: 200_000, uploaded: 100_000)]
+        ),
+        snapshot(
+            name: "Downloader", pid: 102, downloaded: 200_000, uploaded: 100_000,
+            connections: [connection(local: "10.0.0.2:5002", remote: "1.1.1.1:443", interface: "en0", downloaded: 200_000, uploaded: 100_000)]
+        )
+    ]
+    _ = globalCapCalculator.consume(
+        capBaseline,
+        interfaceTotals: ["en0": BytePair(downloaded: 1_000_000, uploaded: 1_000_000)],
+        proxySettings: settings,
+        at: start
+    )
+    let globallyCapped = globalCapCalculator.consume(
+        capNext,
+        interfaceTotals: ["en0": BytePair(downloaded: 1_150_000, uploaded: 1_060_000)],
+        proxySettings: settings,
+        at: start.addingTimeInterval(5)
+    )
+    try expect(
+        total(of: globallyCapped) == BytePair(downloaded: 150_000, uploaded: 60_000),
+        "所有进程之和不得突破物理网卡增量"
+    )
+    print("✓ 物理网卡全局预算守恒")
+
+    let relayCalculator = DeltaCalculator()
+    let relayBaseline = [
+        snapshot(
+            name: "nsurlsessiond", pid: 201, downloaded: 100_000, uploaded: 50_000,
+            connections: [connection(local: "10.99.0.2:5001", remote: "8.8.8.8:443", interface: "utun9", downloaded: 100_000, uploaded: 50_000)]
+        ),
+        snapshot(
+            name: "magicspeed-arm6", pid: 202, downloaded: 100_000, uploaded: 50_000,
+            connections: [connection(local: "10.0.0.2:5002", remote: "23.141.196.52:30116", interface: "en0", downloaded: 100_000, uploaded: 50_000)]
+        )
+    ]
+    let relayNext = [
+        snapshot(
+            name: "nsurlsessiond", pid: 201, downloaded: 180_000, uploaded: 70_000,
+            connections: [connection(local: "10.99.0.2:5001", remote: "8.8.8.8:443", interface: "utun9", downloaded: 180_000, uploaded: 70_000)]
+        ),
+        snapshot(
+            name: "magicspeed-arm6", pid: 202, downloaded: 184_000, uploaded: 74_000,
+            connections: [connection(local: "10.0.0.2:5002", remote: "23.141.196.52:30116", interface: "en0", downloaded: 184_000, uploaded: 74_000)]
+        )
+    ]
+    _ = relayCalculator.consume(
+        relayBaseline,
+        interfaceTotals: ["en0": BytePair(downloaded: 2_000_000, uploaded: 1_000_000)],
+        proxySettings: settings,
+        at: start
+    )
+    let deDuplicated = relayCalculator.consume(
+        relayNext,
+        interfaceTotals: ["en0": BytePair(downloaded: 2_090_000, uploaded: 1_030_000)],
+        proxySettings: settings,
+        at: start.addingTimeInterval(5)
+    )
+    try expect(total(of: deDuplicated) == BytePair(downloaded: 90_000, uploaded: 30_000), "代理去重后必须与物理网卡总量一致")
+    try expect(deDuplicated.deltas.first { $0.name == "magicspeed-arm6" } == nil, "转发核心不得再次累计外网流量")
+    try expect(
+        deDuplicated.deltas.first { $0.name == "nsurlsessiond" }?.bytes[.proxy] == BytePair(downloaded: 80_000, uploaded: 20_000),
+        "被确认的隧道客户端流量应归入代理"
+    )
+    try expect(
+        deDuplicated.deltas.first { $0.name == "其他网络流量" }?.bytes[.direct] == BytePair(downloaded: 10_000, uploaded: 10_000),
+        "未归属的协议开销应单列"
+    )
+    print("✓ MagicHut/TUN 转发层重复计费消除")
+
+    let directCoreCalculator = DeltaCalculator()
+    let directCoreBaseline = snapshot(
+        name: "magicspeed-arm6", pid: 301, downloaded: 100_000, uploaded: 50_000,
+        connections: [connection(local: "10.0.0.2:5003", remote: "23.141.196.52:30116", interface: "en0", downloaded: 100_000, uploaded: 50_000)]
+    )
+    let directCoreNext = snapshot(
+        name: "magicspeed-arm6", pid: 301, downloaded: 110_000, uploaded: 55_000,
+        connections: [connection(local: "10.0.0.2:5003", remote: "23.141.196.52:30116", interface: "en0", downloaded: 110_000, uploaded: 55_000)]
+    )
+    _ = directCoreCalculator.consume(
+        [directCoreBaseline],
+        interfaceTotals: ["en0": BytePair(downloaded: 3_000_000, uploaded: 2_000_000)],
+        proxySettings: settings,
+        at: start
+    )
+    let directCore = directCoreCalculator.consume(
+        [directCoreNext],
+        interfaceTotals: ["en0": BytePair(downloaded: 3_011_000, uploaded: 2_006_000)],
+        proxySettings: settings,
+        at: start.addingTimeInterval(5)
+    )
+    try expect(
+        directCore.deltas.first { $0.name == "magicspeed-arm6" }?.bytes[.direct] == BytePair(downloaded: 10_000, uploaded: 5_000),
+        "没有逻辑客户端证据时不能仅凭名称隐藏流量"
+    )
+    print("✓ 转发核心识别防误杀")
+
+    let unrelatedTunnelCalculator = DeltaCalculator()
+    let unrelatedBaseline = [
+        snapshot(
+            name: "VPN Client", pid: 311, downloaded: 100_000, uploaded: 10_000,
+            connections: [connection(local: "10.99.0.2:6001", remote: "8.8.4.4:443", interface: "utun12", downloaded: 100_000, uploaded: 10_000)]
+        ),
+        snapshot(
+            name: "magicspeed-arm6", pid: 312, downloaded: 100_000, uploaded: 50_000,
+            connections: [connection(local: "10.0.0.2:6002", remote: "23.141.196.52:30116", interface: "en0", downloaded: 100_000, uploaded: 50_000)]
+        )
+    ]
+    let unrelatedNext = [
+        snapshot(
+            name: "VPN Client", pid: 311, downloaded: 1_100_000, uploaded: 110_000,
+            connections: [connection(local: "10.99.0.2:6001", remote: "8.8.4.4:443", interface: "utun12", downloaded: 1_100_000, uploaded: 110_000)]
+        ),
+        snapshot(
+            name: "magicspeed-arm6", pid: 312, downloaded: 105_000, uploaded: 51_000,
+            connections: [connection(local: "10.0.0.2:6002", remote: "23.141.196.52:30116", interface: "en0", downloaded: 105_000, uploaded: 51_000)]
+        )
+    ]
+    _ = unrelatedTunnelCalculator.consume(
+        unrelatedBaseline,
+        interfaceTotals: ["en0": BytePair(downloaded: 4_000_000, uploaded: 3_000_000)],
+        proxySettings: settings,
+        at: start
+    )
+    let unrelatedTunnel = unrelatedTunnelCalculator.consume(
+        unrelatedNext,
+        interfaceTotals: ["en0": BytePair(downloaded: 5_005_000, uploaded: 3_101_000)],
+        proxySettings: settings,
+        at: start.addingTimeInterval(5)
+    )
+    try expect(
+        unrelatedTunnel.deltas.first { $0.name == "magicspeed-arm6" }?.bytes[.direct] == BytePair(downloaded: 5_000, uploaded: 1_000),
+        "不相似的其他隧道流量不能误触发转发去重"
+    )
+    print("✓ 多代理并存防误判")
+
+    let localCapCalculator = DeltaCalculator()
+    let localBaseline = [
+        snapshot(
+            name: "Client", pid: 401, downloaded: 100_000, uploaded: 100_000,
+            connections: [connection(local: "127.0.0.1:5001", remote: "127.0.0.1:6001", interface: "lo0", downloaded: 100_000, uploaded: 100_000)]
+        ),
+        snapshot(
+            name: "Server", pid: 402, downloaded: 100_000, uploaded: 100_000,
+            connections: [connection(local: "127.0.0.1:6001", remote: "127.0.0.1:5001", interface: "lo0", downloaded: 100_000, uploaded: 100_000)]
+        )
+    ]
+    let localNext = [
+        snapshot(
+            name: "Client", pid: 401, downloaded: 150_000, uploaded: 150_000,
+            connections: [connection(local: "127.0.0.1:5001", remote: "127.0.0.1:6001", interface: "lo0", downloaded: 150_000, uploaded: 150_000)]
+        ),
+        snapshot(
+            name: "Server", pid: 402, downloaded: 150_000, uploaded: 150_000,
+            connections: [connection(local: "127.0.0.1:6001", remote: "127.0.0.1:5001", interface: "lo0", downloaded: 150_000, uploaded: 150_000)]
+        )
+    ]
+    _ = localCapCalculator.consume(
+        localBaseline,
+        interfaceTotals: ["lo0": BytePair(downloaded: 5_000_000, uploaded: 5_000_000)],
+        proxySettings: settings,
+        at: start
+    )
+    let localCapped = localCapCalculator.consume(
+        localNext,
+        interfaceTotals: ["lo0": BytePair(downloaded: 5_050_000, uploaded: 5_050_000)],
+        proxySettings: settings,
+        at: start.addingTimeInterval(5)
+    )
+    try expect(total(of: localCapped) == BytePair(downloaded: 50_000, uploaded: 50_000), "回环两端不得重复累计")
+    print("✓ 本地回环流量去重")
+
     let temporary = FileManager.default.temporaryDirectory
         .appendingPathComponent("TrafficBarVerifier-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: temporary) }
@@ -149,7 +339,7 @@ private func runVerification() throws {
     let reloaded = try TrafficLedger(directoryURL: temporary)
     try expect(reloaded.totals(window: .hour, filter: .all, at: now) == BytePair(downloaded: 10, uploaded: 5), "近一小时数据必须在重启后恢复")
     try expect(reloaded.totals(window: .today, filter: .all, at: now) == BytePair(downloaded: 10, uploaded: 5), "当天汇总必须持久化")
-    print("✓ V2 小时账本跨重启恢复")
+    print("✓ V3 小时账本跨重启恢复")
 }
 
 do {

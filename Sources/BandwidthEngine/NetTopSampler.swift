@@ -42,14 +42,15 @@ public final class NetTopSampler: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.crossng.trafficbar.sampler", qos: .utility)
     private let executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
     private let parser = NetworkLineParser()
+    private let interfaceSampler = InterfaceCounterSampler()
     private let timeout: TimeInterval
 
     public init(timeout: TimeInterval = 5) {
         self.timeout = timeout
     }
 
-    public func sample(completion: @escaping (Result<[ProcessSnapshot], Error>) -> Void) {
-        queue.async { [executableURL, parser, timeout] in
+    public func sample(completion: @escaping (Result<NetworkSample, Error>) -> Void) {
+        queue.async { [executableURL, parser, interfaceSampler, timeout] in
             guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
                 DispatchQueue.main.async { completion(.failure(NetTopSamplerError.unavailable)) }
                 return
@@ -115,7 +116,11 @@ public final class NetTopSampler: @unchecked Sendable {
                 return
             }
 
-            DispatchQueue.main.async { completion(.success(snapshots)) }
+            let sample = NetworkSample(
+                processes: snapshots,
+                interfaceTotals: interfaceSampler.sample()
+            )
+            DispatchQueue.main.async { completion(.success(sample)) }
         }
     }
 }
