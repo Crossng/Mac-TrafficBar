@@ -218,6 +218,10 @@ private func runVerification() throws {
         deDuplicated.deltas.first { $0.name == "其他网络流量" }?.bytes[.direct] == BytePair(downloaded: 10_000, uploaded: 10_000),
         "未归属的协议开销应单列"
     )
+    try expect(
+        deDuplicated.rates["nsurlsessiond"]?[.proxy] == BytePair(downloaded: 16_000, uploaded: 4_000),
+        "实时速度必须保留路径维度以匹配界面筛选"
+    )
     print("✓ MagicHut/TUN 转发层重复计费消除")
 
     let directCoreCalculator = DeltaCalculator()
@@ -327,19 +331,43 @@ private func runVerification() throws {
     defer { try? FileManager.default.removeItem(at: temporary) }
 
     let ledger = try TrafficLedger(directoryURL: temporary)
-    let delta = TrafficDelta(
-        key: "Browser",
-        name: "Browser",
-        pid: 42,
-        bytes: [.proxy: BytePair(downloaded: 10, uploaded: 5)]
-    )
+    let deltas = [
+        TrafficDelta(
+            key: "Browser",
+            name: "Browser",
+            pid: 42,
+            bytes: [.proxy: BytePair(downloaded: 10, uploaded: 5)]
+        ),
+        TrafficDelta(
+            key: "Downloader",
+            name: "Downloader",
+            pid: 43,
+            bytes: [.direct: BytePair(downloaded: 20, uploaded: 5)]
+        ),
+        TrafficDelta(
+            key: "Local Helper",
+            name: "Local Helper",
+            pid: 44,
+            bytes: [.local: BytePair(downloaded: 100, uploaded: 100)]
+        )
+    ]
     let now = Date()
-    ledger.record([delta], at: now)
+    ledger.record(deltas, at: now)
 
     let reloaded = try TrafficLedger(directoryURL: temporary)
-    try expect(reloaded.totals(window: .hour, filter: .all, at: now) == BytePair(downloaded: 10, uploaded: 5), "近一小时数据必须在重启后恢复")
-    try expect(reloaded.totals(window: .today, filter: .all, at: now) == BytePair(downloaded: 10, uploaded: 5), "当天汇总必须持久化")
-    print("✓ V3 小时账本跨重启恢复")
+    try expect(
+        reloaded.totals(window: .hour, filter: .external, at: now) == BytePair(downloaded: 30, uploaded: 10),
+        "外网筛选必须只合并代理与直连"
+    )
+    try expect(
+        reloaded.totals(window: .today, filter: .local, at: now) == BytePair(downloaded: 100, uploaded: 100),
+        "本地通信必须独立统计"
+    )
+    try expect(
+        reloaded.summaries(window: .today, filter: .external, at: now).allSatisfy { $0.name != "Local Helper" },
+        "默认外网排行不得混入仅有本地通信的进程"
+    )
+    print("✓ V3 账本恢复与外网/本地语义")
 }
 
 do {

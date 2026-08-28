@@ -30,7 +30,7 @@ private final class MonitorSession {
     private var timer: Timer?
     private var sampling = false
 
-    private(set) var rates: [String: BytePair] = [:]
+    private(set) var rates: [String: [TrafficPath: BytePair]] = [:]
     private(set) var icons: [String: NSImage] = [:]
     private(set) var lastUpdated: Date?
     private(set) var lastError: String?
@@ -86,6 +86,19 @@ private final class MonitorSession {
 
     func summaries(window: TimeWindow, filter: FlowFilter) -> [ApplicationSummary] {
         ledger.summaries(window: window, filter: filter)
+    }
+
+    func rate(for key: String, filter: FlowFilter) -> BytePair {
+        guard let pathRates = rates[key] else { return BytePair() }
+        return pathRates.reduce(into: BytePair()) { result, item in
+            if filter.includes(item.key) { result.add(item.value) }
+        }
+    }
+
+    func totalRate(filter: FlowFilter) -> BytePair {
+        rates.keys.reduce(into: BytePair()) { result, key in
+            result.add(rate(for: key, filter: filter))
+        }
     }
 }
 
@@ -320,7 +333,7 @@ private final class TrafficRowView: NSView {
 private final class DashboardViewController: NSViewController {
     private let session: MonitorSession
     private var windowChoice = TimeWindow.today
-    private var filterChoice = FlowFilter.all
+    private var filterChoice = FlowFilter.external
 
     private let updatedLabel = NSTextField(labelWithString: "")
     private let overviewCaption = NSTextField(labelWithString: "")
@@ -430,7 +443,7 @@ private final class DashboardViewController: NSViewController {
         let totals = session.ledger.totals(window: windowChoice, filter: filterChoice)
         overviewCaption.stringValue = overviewCaptionText
         totalLabel.stringValue = ByteText.amount(totals.total)
-        let liveTotal = session.rates.values.reduce(into: BytePair()) { $0.add($1) }
+        let liveTotal = session.totalRate(filter: .external)
         speedLabel.stringValue = "↓ \(ByteText.rate(liveTotal.downloaded))   ↑ \(ByteText.rate(liveTotal.uploaded))"
 
         for path in TrafficPath.allCases {
@@ -449,7 +462,12 @@ private final class DashboardViewController: NSViewController {
         rows.arrangedSubviews.forEach { rows.removeArrangedSubview($0); $0.removeFromSuperview() }
         let maximum = summaries.first?.total.total ?? 1
         for summary in summaries.prefix(30) {
-            let row = TrafficRowView(summary: summary, rate: session.rates[summary.id] ?? BytePair(), icon: icon(for: summary), maximum: maximum)
+            let row = TrafficRowView(
+                summary: summary,
+                rate: session.rate(for: summary.id, filter: filterChoice),
+                icon: icon(for: summary),
+                maximum: maximum
+            )
             rows.addArrangedSubview(row)
             let widthConstraint = row.widthAnchor.constraint(equalTo: rows.widthAnchor)
             rowWidthConstraints.append(widthConstraint)
@@ -512,10 +530,14 @@ private final class DashboardViewController: NSViewController {
         cards.spacing = 0
         cards.translatesAutoresizingMaskIntoConstraints = false
         for path in TrafficPath.allCases {
-            let title = NSTextField(labelWithString: path.title)
+            let metricTitle = path == .local ? "本地通信" : path.title
+            let title = NSTextField(labelWithString: metricTitle)
             title.alignment = .left
             title.textColor = .secondaryLabelColor
             title.font = .systemFont(ofSize: 10.5, weight: .medium)
+            title.maximumNumberOfLines = 1
+            title.lineBreakMode = .byTruncatingTail
+            title.toolTip = metricTitle
 
             let value = routeLabels[path]!
             value.alignment = .left
@@ -532,7 +554,7 @@ private final class DashboardViewController: NSViewController {
             let symbol = NSImageView()
             symbol.image = NSImage(
                 systemSymbolName: routeSymbolName(for: path),
-                accessibilityDescription: path.title
+                accessibilityDescription: metricTitle
             )
             symbol.contentTintColor = .secondaryLabelColor
             symbol.imageScaling = .scaleProportionallyDown
@@ -568,8 +590,12 @@ private final class DashboardViewController: NSViewController {
         case .month: period = "本月"
         }
 
-        let scope = filterChoice == .all ? "" : filterChoice.title
-        return "\(period)\(scope)流量"
+        switch filterChoice {
+        case .external: return "\(period)外网流量（代理 + 直连）"
+        case .proxy: return "\(period)代理流量"
+        case .direct: return "\(period)直连流量"
+        case .local: return "\(period)本地通信（不消耗套餐流量）"
+        }
     }
 
     private func routeSymbolName(for path: TrafficPath) -> String {
@@ -602,7 +628,7 @@ private final class DashboardViewController: NSViewController {
         actions.setCustomSpacing(8, after: folder)
         actions.setCustomSpacing(8, after: divider)
 
-        let versionNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0"
+        let versionNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.0"
         let version = NSTextField(labelWithString: "TrafficBar \(versionNumber)")
         version.textColor = .tertiaryLabelColor
         version.font = .systemFont(ofSize: 10.5, weight: .medium)

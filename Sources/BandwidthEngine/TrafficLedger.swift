@@ -92,7 +92,7 @@ public final class TrafficLedger: @unchecked Sendable {
         for (key, name, paths) in entries {
             var item = grouped[key] ?? (name, [:])
             for (path, bytes) in paths {
-                guard filter.path == nil || filter.path == path else { continue }
+                guard filter.includes(path) else { continue }
                 item.paths[path, default: BytePair()].add(bytes)
             }
             grouped[key] = item

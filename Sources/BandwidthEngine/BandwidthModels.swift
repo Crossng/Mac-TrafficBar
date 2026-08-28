@@ -15,26 +15,26 @@ public enum TrafficPath: String, CaseIterable, Codable, Hashable, Sendable {
 }
 
 public enum FlowFilter: String, CaseIterable, Sendable {
-    case all
+    case external
     case proxy
     case direct
     case local
 
     public var title: String {
         switch self {
-        case .all: return "全部"
+        case .external: return "外网"
         case .proxy: return "代理"
         case .direct: return "直连"
         case .local: return "本地"
         }
     }
 
-    public var path: TrafficPath? {
+    public func includes(_ path: TrafficPath) -> Bool {
         switch self {
-        case .all: return nil
-        case .proxy: return .proxy
-        case .direct: return .direct
-        case .local: return .local
+        case .external: return path == .proxy || path == .direct
+        case .proxy: return path == .proxy
+        case .direct: return path == .direct
+        case .local: return path == .local
         }
     }
 }

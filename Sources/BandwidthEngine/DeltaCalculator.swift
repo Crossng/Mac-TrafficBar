@@ -2,10 +2,10 @@ import Foundation
 
 public struct SampleResult: Sendable {
     public let deltas: [TrafficDelta]
-    public let rates: [String: BytePair]
+    public let rates: [String: [TrafficPath: BytePair]]
     public let timestamp: Date
 
-    public init(deltas: [TrafficDelta], rates: [String: BytePair], timestamp: Date) {
+    public init(deltas: [TrafficDelta], rates: [String: [TrafficPath: BytePair]], timestamp: Date) {
         self.deltas = deltas
         self.rates = rates
         self.timestamp = timestamp
@@ -189,15 +189,18 @@ public final class DeltaCalculator: @unchecked Sendable {
         let deltas = mutable.map {
             TrafficDelta(key: $0.key, name: $0.name, pid: $0.pid, bytes: $0.bytes)
         }
-        var rates: [String: BytePair] = [:]
+        var rates: [String: [TrafficPath: BytePair]] = [:]
         for delta in deltas {
-            let total = delta.total
-            rates[delta.name, default: BytePair()].add(
-                BytePair(
-                    downloaded: UInt64(Double(total.downloaded) / elapsed),
-                    uploaded: UInt64(Double(total.uploaded) / elapsed)
+            var pathRates = rates[delta.name] ?? [:]
+            for (path, bytes) in delta.bytes {
+                pathRates[path, default: BytePair()].add(
+                    BytePair(
+                        downloaded: UInt64(Double(bytes.downloaded) / elapsed),
+                        uploaded: UInt64(Double(bytes.uploaded) / elapsed)
+                    )
                 )
-            )
+            }
+            rates[delta.name] = pathRates
         }
 
         return SampleResult(deltas: deltas, rates: rates, timestamp: time)
