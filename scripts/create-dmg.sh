@@ -17,6 +17,20 @@ MOUNT_DIR="/Volumes/$VOLUME_NAME"
 RW_DMG="$WORK_DIR/TrafficBar-rw.dmg"
 ATTACHED=0
 
+detach_volume() {
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if hdiutil detach "$MOUNT_DIR" >/dev/null 2>&1; then
+            ATTACHED=0
+            return 0
+        fi
+        sleep 1
+    done
+
+    hdiutil detach "$MOUNT_DIR" -force >/dev/null
+    ATTACHED=0
+}
+
 cleanup() {
     if [[ "$ATTACHED" -eq 1 ]]; then
         hdiutil detach "$MOUNT_DIR" -force >/dev/null 2>&1 || true
@@ -83,8 +97,7 @@ APPLESCRIPT
 
 rm -rf "$MOUNT_DIR/.fseventsd" "$MOUNT_DIR/.Spotlight-V100" "$MOUNT_DIR/.Trashes"
 sync
-hdiutil detach "$MOUNT_DIR" >/dev/null
-ATTACHED=0
+detach_volume
 
 rm -f "$OUTPUT_DMG"
 hdiutil convert \
