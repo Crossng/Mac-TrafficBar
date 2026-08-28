@@ -17,6 +17,7 @@ APP_DIR="$DIST_DIR/$APP_NAME.app"
 ICON_BASENAME="TrafficBarIcon-$VERSION"
 ICONSET_DIR="$DIST_DIR/$ICON_BASENAME.iconset"
 ICON_FILE="$DIST_DIR/$ICON_BASENAME.icns"
+DMG_BACKGROUND="$DIST_DIR/TrafficBarInstallerBackground.png"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -27,6 +28,8 @@ swift build -c release
 mkdir -p Resources "$DIST_DIR"
 swiftc scripts/make-icon.swift -o "$DIST_DIR/.make-icon"
 "$DIST_DIR/.make-icon" Resources/TrafficBarIcon.png
+swiftc scripts/make-dmg-background.swift -o "$DIST_DIR/.make-dmg-background"
+"$DIST_DIR/.make-dmg-background" "$DMG_BACKGROUND"
 
 rm -rf "$ICONSET_DIR"
 mkdir -p "$ICONSET_DIR"
@@ -94,13 +97,9 @@ codesign --force --deep --sign - "$APP_DIR" >/dev/null
 ARCH="$(uname -m)"
 DMG="$DIST_DIR/${APP_NAME}-macos-${ARCH}.dmg"
 ARCHIVE="$DIST_DIR/${APP_NAME}-macos-${ARCH}.tar.gz"
-STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trafficbar-dmg.XXXXXX")"
 APPCAST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/trafficbar-appcast.XXXXXX")"
-trap 'rm -rf "$STAGE_DIR" "$APPCAST_DIR" "$DIST_DIR/.make-icon" "$ICONSET_DIR"' EXIT
-mkdir -p "$STAGE_DIR"
-ditto "$APP_DIR" "$STAGE_DIR/流量管家.app"
-ln -s /Applications "$STAGE_DIR/应用程序"
-hdiutil create -volname "流量管家" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG" >/dev/null
+trap 'rm -rf "$APPCAST_DIR" "$DIST_DIR/.make-icon" "$DIST_DIR/.make-dmg-background" "$DMG_BACKGROUND" "$ICONSET_DIR"' EXIT
+bash scripts/create-dmg.sh "$APP_DIR" "$DMG" "$DMG_BACKGROUND"
 tar -czf "$ARCHIVE" -C "$DIST_DIR" "$APP_NAME.app"
 shasum -a 256 "$DMG" | awk '{print $1}' > "$DMG.sha256"
 shasum -a 256 "$ARCHIVE" | awk '{print $1}' > "$ARCHIVE.sha256"
