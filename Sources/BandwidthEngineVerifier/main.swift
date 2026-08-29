@@ -368,6 +368,65 @@ private func runVerification() throws {
         "默认外网排行不得混入仅有本地通信的进程"
     )
     print("✓ V3 账本恢复与外网/本地语义")
+
+    let compactDirectory = temporary.appendingPathComponent("compact", isDirectory: true)
+    let calendar = Calendar.current
+    let anchor = calendar.startOfDay(for: now).addingTimeInterval(12 * 3_600)
+    let compactLedger = try TrafficLedger(
+        directoryURL: compactDirectory,
+        referenceDate: anchor,
+        recentCompactionInterval: 60
+    )
+    func compactDelta(_ downloaded: UInt64) -> [TrafficDelta] {
+        [
+            TrafficDelta(
+                key: "Browser",
+                name: "Browser",
+                pid: 42,
+                bytes: [.direct: BytePair(downloaded: downloaded, uploaded: 0)]
+            )
+        ]
+    }
+    compactLedger.record(compactDelta(10), at: anchor.addingTimeInterval(-7_200))
+    compactLedger.record(compactDelta(20), at: anchor.addingTimeInterval(-1_800))
+    compactLedger.record(compactDelta(30), at: anchor)
+
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = .current
+    formatter.dateFormat = "yyyy-MM-dd"
+    let compactRecentURL = compactDirectory
+        .appendingPathComponent("recent-\(formatter.string(from: anchor)).jsonl")
+    let compactText = try String(contentsOf: compactRecentURL, encoding: .utf8)
+    try expect(compactText.split(whereSeparator: \.isNewline).count == 2, "最近日志应淘汰一小时前的逐次记录")
+
+    let compactReloaded = try TrafficLedger(directoryURL: compactDirectory, referenceDate: anchor)
+    try expect(
+        compactReloaded.totals(window: .hour, filter: .external, at: anchor).downloaded == 50,
+        "压缩后重启必须保留最近一小时统计"
+    )
+    try expect(
+        compactReloaded.totals(window: .today, filter: .external, at: anchor).downloaded == 60,
+        "压缩最近日志不得改变日汇总"
+    )
+    print("✓ 最近一小时日志压缩且日汇总不丢失")
+
+    let midnightDirectory = temporary.appendingPathComponent("midnight", isDirectory: true)
+    let shortlyAfterMidnight = calendar.startOfDay(for: now).addingTimeInterval(20 * 60)
+    let midnightLedger = try TrafficLedger(
+        directoryURL: midnightDirectory,
+        referenceDate: shortlyAfterMidnight,
+        recentCompactionInterval: 0
+    )
+    midnightLedger.record(compactDelta(40), at: shortlyAfterMidnight.addingTimeInterval(-40 * 60))
+    midnightLedger.record(compactDelta(50), at: shortlyAfterMidnight)
+    let midnightReloaded = try TrafficLedger(directoryURL: midnightDirectory, referenceDate: shortlyAfterMidnight)
+    try expect(
+        midnightReloaded.totals(window: .hour, filter: .external, at: shortlyAfterMidnight).downloaded == 90,
+        "跨午夜压缩必须保留前一天最近一小时记录"
+    )
+    print("✓ 最近一小时日志可跨午夜恢复")
 }
 
 do {

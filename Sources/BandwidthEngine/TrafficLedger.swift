@@ -22,9 +22,18 @@ public final class TrafficLedger: @unchecked Sendable {
     private let lock = NSLock()
     private let recentEncoder: JSONEncoder
     private let recentDecoder: JSONDecoder
+    private let recentRetentionInterval: TimeInterval
+    private let recentCompactionInterval: TimeInterval
     private var recent: [RecentDelta]
+    private var lastRecentCompaction: Date
 
-    public init(directoryURL: URL? = nil, calendar: Calendar = .current) throws {
+    public init(
+        directoryURL: URL? = nil,
+        calendar: Calendar = .current,
+        referenceDate: Date = Date(),
+        recentRetentionInterval: TimeInterval = 3_600,
+        recentCompactionInterval: TimeInterval = 600
+    ) throws {
         self.calendar = calendar
         self.storageDirectoryURL = directoryURL ?? FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -32,13 +41,17 @@ public final class TrafficLedger: @unchecked Sendable {
             .appendingPathComponent("engine-v3", isDirectory: true)
         self.recentEncoder = JSONEncoder()
         self.recentDecoder = JSONDecoder()
+        self.recentRetentionInterval = max(recentRetentionInterval, 60)
+        self.recentCompactionInterval = max(recentCompactionInterval, 0)
         self.recent = []
+        self.lastRecentCompaction = referenceDate
         recentEncoder.dateEncodingStrategy = .iso8601
         recentDecoder.dateDecodingStrategy = .iso8601
 
         try FileManager.default.createDirectory(at: storageDirectoryURL, withIntermediateDirectories: true)
-        loadRecent(referenceDate: Date())
-        removeStaleFiles(referenceDate: Date())
+        loadRecent(referenceDate: referenceDate)
+        compactRecentFiles(referenceDate: referenceDate)
+        removeStaleFiles(referenceDate: referenceDate)
     }
 
     public func record(_ deltas: [TrafficDelta], at date: Date = Date()) {
@@ -63,10 +76,13 @@ public final class TrafficLedger: @unchecked Sendable {
             events.append(event)
         }
 
-        let cutoff = date.addingTimeInterval(-3600)
+        let cutoff = date.addingTimeInterval(-recentRetentionInterval)
         recent.removeAll { $0.date < cutoff }
         saveDay(day, identifier: dayID)
         appendRecent(events, identifier: dayID)
+        if shouldCompactRecent(at: date) {
+            compactRecentFiles(referenceDate: date)
+        }
         removeStaleFiles(referenceDate: date)
     }
 
@@ -77,7 +93,7 @@ public final class TrafficLedger: @unchecked Sendable {
         let entries: [(String, String, [TrafficPath: BytePair])]
         switch window {
         case .hour:
-            let cutoff = date.addingTimeInterval(-3600)
+            let cutoff = date.addingTimeInterval(-recentRetentionInterval)
             entries = recent
                 .filter { $0.date >= cutoff && $0.date <= date }
                 .map { ($0.key, $0.name, $0.paths) }
@@ -133,8 +149,8 @@ public final class TrafficLedger: @unchecked Sendable {
     }
 
     private func loadRecent(referenceDate: Date) {
-        let start = calendar.date(byAdding: .day, value: -1, to: referenceDate) ?? referenceDate
-        let cutoff = referenceDate.addingTimeInterval(-3600)
+        let start = referenceDate.addingTimeInterval(-recentRetentionInterval)
+        let cutoff = referenceDate.addingTimeInterval(-recentRetentionInterval)
 
         recent = dayIdentifiers(from: start, through: referenceDate).flatMap { identifier -> [RecentDelta] in
             let url = recentFileURL(for: identifier)
@@ -153,6 +169,51 @@ public final class TrafficLedger: @unchecked Sendable {
                 return event
             }
         }
+    }
+
+    private func shouldCompactRecent(at date: Date) -> Bool {
+        if date < lastRecentCompaction { return true }
+        return date.timeIntervalSince(lastRecentCompaction) >= recentCompactionInterval
+    }
+
+    private func compactRecentFiles(referenceDate: Date) {
+        let cutoff = referenceDate.addingTimeInterval(-recentRetentionInterval)
+        recent.removeAll { $0.date < cutoff || $0.date > referenceDate }
+
+        let grouped = Dictionary(grouping: recent) { dayIdentifier(for: $0.date) }
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: storageDirectoryURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            lastRecentCompaction = referenceDate
+            return
+        }
+
+        var identifiers = Set(grouped.keys)
+        for file in files where file.lastPathComponent.hasPrefix("recent-") && file.pathExtension == "jsonl" {
+            identifiers.insert(String(file.deletingPathExtension().lastPathComponent.dropFirst(7)))
+        }
+
+        for identifier in identifiers {
+            let url = recentFileURL(for: identifier)
+            let events = (grouped[identifier] ?? []).sorted { $0.date < $1.date }
+
+            guard !events.isEmpty else {
+                try? FileManager.default.removeItem(at: url)
+                continue
+            }
+
+            var data = Data()
+            for event in events {
+                guard var line = try? recentEncoder.encode(event) else { continue }
+                line.append(0x0A)
+                data.append(line)
+            }
+            try? data.write(to: url, options: .atomic)
+        }
+
+        lastRecentCompaction = referenceDate
     }
 
     private func dayIdentifier(for date: Date) -> String {
