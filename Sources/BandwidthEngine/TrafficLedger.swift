@@ -17,6 +17,20 @@ public final class TrafficLedger: @unchecked Sendable {
         let paths: [TrafficPath: BytePair]
     }
 
+    private struct StoredNetworkUsage: Codable {
+        let networkID: String
+        let sessionID: String?
+        var kind: NetworkKind
+        var firstSeen: Date
+        var lastSeen: Date
+        var paths: [TrafficPath: BytePair]
+    }
+
+    private struct NetworkDayFile: Codable {
+        var networks: [String: StoredNetworkUsage]
+        var sessions: [String: StoredNetworkUsage]
+    }
+
     public let storageDirectoryURL: URL
     private let calendar: Calendar
     private let lock = NSLock()
@@ -54,7 +68,11 @@ public final class TrafficLedger: @unchecked Sendable {
         removeStaleFiles(referenceDate: referenceDate)
     }
 
-    public func record(_ deltas: [TrafficDelta], at date: Date = Date()) {
+    public func record(
+        _ deltas: [TrafficDelta],
+        at date: Date = Date(),
+        networkContext: NetworkContext? = nil
+    ) {
         guard !deltas.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
@@ -79,6 +97,9 @@ public final class TrafficLedger: @unchecked Sendable {
         let cutoff = date.addingTimeInterval(-recentRetentionInterval)
         recent.removeAll { $0.date < cutoff }
         saveDay(day, identifier: dayID)
+        if let networkContext {
+            recordNetworkUsage(deltas, context: networkContext, date: date, identifier: dayID)
+        }
         appendRecent(events, identifier: dayID)
         if shouldCompactRecent(at: date) {
             compactRecentFiles(referenceDate: date)
@@ -129,6 +150,128 @@ public final class TrafficLedger: @unchecked Sendable {
             .reduce(into: BytePair()) { $0.add($1.total) }
     }
 
+    public func currentSessionSummary(
+        for context: NetworkContext,
+        at date: Date = Date()
+    ) -> NetworkUsageSummary? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let retentionStart = calendar.date(byAdding: .day, value: -62, to: date) ?? date
+        let requestedStart = context.connectedAt ?? calendar.startOfDay(for: date)
+        let start = max(retentionStart, min(requestedStart, date))
+        let records = dayIdentifiers(from: start, through: date).compactMap { identifier in
+            loadNetworkDay(identifier).sessions[context.sessionID]
+        }
+        return aggregateNetworkUsage(records, fallbackContext: context, sessionID: context.sessionID)
+    }
+
+    public func networkSummaries(window: TimeWindow, at date: Date = Date()) -> [NetworkUsageSummary] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let start = startDate(for: window, referenceDate: date)
+        let records = dayIdentifiers(from: start, through: date).flatMap { identifier in
+            Array(loadNetworkDay(identifier).networks.values)
+        }
+        let grouped = Dictionary(grouping: records, by: \.networkID)
+        return grouped.compactMap { _, records in
+            aggregateNetworkUsage(records, fallbackContext: nil, sessionID: nil)
+        }.sorted { lhs, rhs in
+            let lhsTotal = lhs.bytes.values.reduce(UInt64(0)) { $0 &+ $1.total }
+            let rhsTotal = rhs.bytes.values.reduce(UInt64(0)) { $0 &+ $1.total }
+            return lhsTotal > rhsTotal
+        }
+    }
+
+    private func recordNetworkUsage(
+        _ deltas: [TrafficDelta],
+        context: NetworkContext,
+        date: Date,
+        identifier: String
+    ) {
+        var paths: [TrafficPath: BytePair] = [:]
+        for delta in deltas {
+            for (path, bytes) in delta.bytes {
+                paths[path, default: BytePair()].add(bytes)
+            }
+        }
+        guard paths.values.contains(where: { $0.total > 0 }) else { return }
+
+        var day = loadNetworkDay(identifier)
+        updateNetworkUsage(
+            &day.networks,
+            key: context.networkID,
+            networkID: context.networkID,
+            sessionID: nil,
+            kind: context.kind,
+            paths: paths,
+            at: date
+        )
+        updateNetworkUsage(
+            &day.sessions,
+            key: context.sessionID,
+            networkID: context.networkID,
+            sessionID: context.sessionID,
+            kind: context.kind,
+            paths: paths,
+            at: date
+        )
+        saveNetworkDay(day, identifier: identifier)
+    }
+
+    private func updateNetworkUsage(
+        _ storage: inout [String: StoredNetworkUsage],
+        key: String,
+        networkID: String,
+        sessionID: String?,
+        kind: NetworkKind,
+        paths: [TrafficPath: BytePair],
+        at date: Date
+    ) {
+        var usage = storage[key] ?? StoredNetworkUsage(
+            networkID: networkID,
+            sessionID: sessionID,
+            kind: kind,
+            firstSeen: date,
+            lastSeen: date,
+            paths: [:]
+        )
+        usage.kind = kind
+        usage.firstSeen = min(usage.firstSeen, date)
+        usage.lastSeen = max(usage.lastSeen, date)
+        for (path, bytes) in paths {
+            usage.paths[path, default: BytePair()].add(bytes)
+        }
+        storage[key] = usage
+    }
+
+    private func aggregateNetworkUsage(
+        _ records: [StoredNetworkUsage],
+        fallbackContext: NetworkContext?,
+        sessionID: String?
+    ) -> NetworkUsageSummary? {
+        guard let first = records.first else { return nil }
+        var firstSeen = first.firstSeen
+        var lastSeen = first.lastSeen
+        var paths: [TrafficPath: BytePair] = [:]
+        for record in records {
+            firstSeen = min(firstSeen, record.firstSeen)
+            lastSeen = max(lastSeen, record.lastSeen)
+            for (path, bytes) in record.paths {
+                paths[path, default: BytePair()].add(bytes)
+            }
+        }
+        return NetworkUsageSummary(
+            networkID: fallbackContext?.networkID ?? first.networkID,
+            sessionID: sessionID,
+            kind: fallbackContext?.kind ?? first.kind,
+            firstSeen: firstSeen,
+            lastSeen: lastSeen,
+            bytes: paths
+        )
+    }
+
     private func appendRecent(_ events: [RecentDelta], identifier: String) {
         guard !events.isEmpty else { return }
         let url = recentFileURL(for: identifier)
@@ -159,14 +302,14 @@ public final class TrafficLedger: @unchecked Sendable {
                 return []
             }
 
-            return text.split(whereSeparator: \.isNewline).compactMap { line in
+            return text.split(whereSeparator: \.isNewline).flatMap { line -> [RecentDelta] in
                 guard let data = String(line).data(using: .utf8),
                       let event = try? recentDecoder.decode(RecentDelta.self, from: data),
                       event.date >= cutoff,
                       event.date <= referenceDate else {
-                    return nil
+                    return []
                 }
-                return event
+                return migratedRecentEvents(event)
             }
         }
     }
@@ -252,12 +395,62 @@ public final class TrafficLedger: @unchecked Sendable {
         storageDirectoryURL.appendingPathComponent("recent-\(identifier).jsonl")
     }
 
+    private func networkDayFileURL(for identifier: String) -> URL {
+        storageDirectoryURL.appendingPathComponent("network-day-\(identifier).json")
+    }
+
     private func loadDay(_ identifier: String) -> DayFile {
         guard let data = try? Data(contentsOf: dayFileURL(for: identifier)),
               let value = try? JSONDecoder().decode(DayFile.self, from: data) else {
             return DayFile(entries: [:])
         }
-        return value
+        return migratedDay(value)
+    }
+
+    private func migratedDay(_ input: DayFile) -> DayFile {
+        guard let legacy = input.entries["__unattributed__"] else { return input }
+        var output = input
+        output.entries.removeValue(forKey: "__unattributed__")
+
+        if let direct = legacy.paths[.direct], direct.total > 0 {
+            output.entries["__unattributed_external__"] = StoredEntry(
+                name: "未归属外网",
+                paths: [.direct: direct]
+            )
+        }
+        if let local = legacy.paths[.local], local.total > 0 {
+            output.entries["__unattributed_local__"] = StoredEntry(
+                name: "未归属本地通信",
+                paths: [.local: local]
+            )
+        }
+        return output
+    }
+
+    private func migratedRecentEvents(_ event: RecentDelta) -> [RecentDelta] {
+        guard event.key == "__unattributed__" else { return [event] }
+        var output: [RecentDelta] = []
+        if let direct = event.paths[.direct], direct.total > 0 {
+            output.append(
+                RecentDelta(
+                    date: event.date,
+                    key: "__unattributed_external__",
+                    name: "未归属外网",
+                    paths: [.direct: direct]
+                )
+            )
+        }
+        if let local = event.paths[.local], local.total > 0 {
+            output.append(
+                RecentDelta(
+                    date: event.date,
+                    key: "__unattributed_local__",
+                    name: "未归属本地通信",
+                    paths: [.local: local]
+                )
+            )
+        }
+        return output
     }
 
     private func saveDay(_ day: DayFile, identifier: String) {
@@ -265,6 +458,22 @@ public final class TrafficLedger: @unchecked Sendable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(day) else { return }
         try? data.write(to: dayFileURL(for: identifier), options: .atomic)
+    }
+
+    private func loadNetworkDay(_ identifier: String) -> NetworkDayFile {
+        guard let data = try? Data(contentsOf: networkDayFileURL(for: identifier)),
+              let value = try? recentDecoder.decode(NetworkDayFile.self, from: data) else {
+            return NetworkDayFile(networks: [:], sessions: [:])
+        }
+        return value
+    }
+
+    private func saveNetworkDay(_ day: NetworkDayFile, identifier: String) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(day) else { return }
+        try? data.write(to: networkDayFileURL(for: identifier), options: .atomic)
     }
 
     private func removeStaleFiles(referenceDate: Date) {
@@ -281,7 +490,10 @@ public final class TrafficLedger: @unchecked Sendable {
             let cutoff: Date
             let dateText: String
 
-            if name.hasPrefix("day-") {
+            if name.hasPrefix("network-day-") {
+                cutoff = dayCutoff
+                dateText = String(name.dropFirst(12))
+            } else if name.hasPrefix("day-") {
                 cutoff = dayCutoff
                 dateText = String(name.dropFirst(4))
             } else if name.hasPrefix("recent-") {

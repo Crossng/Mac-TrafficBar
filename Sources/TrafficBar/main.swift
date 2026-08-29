@@ -32,6 +32,7 @@ private final class MonitorSession {
 
     private(set) var rates: [String: [TrafficPath: BytePair]] = [:]
     private(set) var icons: [String: NSImage] = [:]
+    private(set) var networkContext: NetworkContext?
     private(set) var lastUpdated: Date?
     private(set) var lastError: String?
     var onChange: (() -> Void)?
@@ -62,6 +63,11 @@ private final class MonitorSession {
             switch result {
             case let .success(networkSample):
                 let now = Date()
+                if self.networkContext?.sessionID != networkSample.networkContext?.sessionID {
+                    self.calculator.reset()
+                    self.rates = [:]
+                }
+                self.networkContext = networkSample.networkContext
                 for snapshot in networkSample.processes {
                     if let icon = NSRunningApplication(processIdentifier: snapshot.pid)?.icon {
                         self.icons[snapshot.name] = icon
@@ -71,9 +77,10 @@ private final class MonitorSession {
                     networkSample.processes,
                     interfaceTotals: networkSample.interfaceTotals,
                     proxySettings: ProxySettings.current(),
+                    networkContext: networkSample.networkContext,
                     at: now
                 )
-                self.ledger.record(sample.deltas, at: now)
+                self.ledger.record(sample.deltas, at: now, networkContext: networkSample.networkContext)
                 self.rates = sample.rates
                 self.lastUpdated = now
                 self.lastError = nil
@@ -99,6 +106,11 @@ private final class MonitorSession {
         rates.keys.reduce(into: BytePair()) { result, key in
             result.add(rate(for: key, filter: filter))
         }
+    }
+
+    func currentNetworkSessionSummary() -> NetworkUsageSummary? {
+        guard let networkContext else { return nil }
+        return ledger.currentSessionSummary(for: networkContext)
     }
 }
 
@@ -339,6 +351,10 @@ private final class DashboardViewController: NSViewController {
     private let overviewCaption = NSTextField(labelWithString: "")
     private let totalLabel = NSTextField(labelWithString: "")
     private let speedLabel = NSTextField(labelWithString: "")
+    private let networkSessionCaption = NSTextField(labelWithString: "")
+    private let networkSessionValue = NSTextField(labelWithString: "")
+    private let networkSessionIcon = NSImageView()
+    private let networkSessionRow = NSStackView()
     private let routeLabels = Dictionary(uniqueKeysWithValues: TrafficPath.allCases.map { ($0, NSTextField(labelWithString: "")) })
     private let rangeControl = NSSegmentedControl(labels: TimeWindow.allCases.map(\.title), trackingMode: .selectOne, target: nil, action: nil)
     private let filterControl = NSSegmentedControl(labels: FlowFilter.allCases.map(\.title), trackingMode: .selectOne, target: nil, action: nil)
@@ -445,6 +461,23 @@ private final class DashboardViewController: NSViewController {
         totalLabel.stringValue = ByteText.amount(totals.total)
         let liveTotal = session.totalRate(filter: .external)
         speedLabel.stringValue = "↓ \(ByteText.rate(liveTotal.downloaded))   ↑ \(ByteText.rate(liveTotal.uploaded))"
+
+        if let context = session.networkContext {
+            let usage = session.currentNetworkSessionSummary()?.total(filter: .external) ?? BytePair()
+            networkSessionCaption.stringValue = "\(context.kind.sessionTitle) · 本机使用"
+            networkSessionValue.stringValue = ByteText.amount(usage.total)
+            let symbolName = context.kind == .hotspot ? "personalhotspot" : "wifi"
+            networkSessionIcon.image = NSImage(
+                systemSymbolName: symbolName,
+                accessibilityDescription: context.kind.sessionTitle
+            )
+            let detail = "首次启用从应用启动后开始统计；切换网络后自动重新开始。只统计这台 Mac 的外网流量，不包含手机或其他热点设备。"
+            networkSessionCaption.toolTip = detail
+            networkSessionValue.toolTip = detail
+            networkSessionRow.isHidden = false
+        } else {
+            networkSessionRow.isHidden = true
+        }
 
         for path in TrafficPath.allCases {
             let value = session.ledger.totals(window: windowChoice, filter: flowFilter(for: path))
@@ -570,13 +603,41 @@ private final class DashboardViewController: NSViewController {
             cards.addArrangedSubview(metric)
         }
 
-        let overview = NSStackView(views: [totalColumn, cards])
+        networkSessionIcon.contentTintColor = .secondaryLabelColor
+        networkSessionIcon.imageScaling = .scaleProportionallyDown
+        networkSessionIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10.5, weight: .medium)
+        networkSessionIcon.translatesAutoresizingMaskIntoConstraints = false
+        networkSessionCaption.font = .systemFont(ofSize: 10.5, weight: .medium)
+        networkSessionCaption.textColor = .secondaryLabelColor
+        networkSessionCaption.maximumNumberOfLines = 1
+        networkSessionValue.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        networkSessionValue.alignment = .right
+        networkSessionValue.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let sessionSpacer = NSView()
+        sessionSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        networkSessionRow.addArrangedSubview(networkSessionIcon)
+        networkSessionRow.addArrangedSubview(networkSessionCaption)
+        networkSessionRow.addArrangedSubview(sessionSpacer)
+        networkSessionRow.addArrangedSubview(networkSessionValue)
+        networkSessionRow.orientation = .horizontal
+        networkSessionRow.alignment = .centerY
+        networkSessionRow.spacing = 5
+        networkSessionRow.isHidden = true
+        NSLayoutConstraint.activate([
+            networkSessionIcon.widthAnchor.constraint(equalToConstant: 14),
+            networkSessionIcon.heightAnchor.constraint(equalToConstant: 14)
+        ])
+
+        let overview = NSStackView(views: [totalColumn, cards, networkSessionRow])
         overview.orientation = .vertical
         overview.alignment = .leading
         overview.spacing = 9
+        overview.setCustomSpacing(6, after: cards)
         overview.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            cards.widthAnchor.constraint(equalTo: overview.widthAnchor)
+            cards.widthAnchor.constraint(equalTo: overview.widthAnchor),
+            networkSessionRow.widthAnchor.constraint(equalTo: overview.widthAnchor)
         ])
         return overview
     }
@@ -628,7 +689,7 @@ private final class DashboardViewController: NSViewController {
         actions.setCustomSpacing(8, after: folder)
         actions.setCustomSpacing(8, after: divider)
 
-        let versionNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.0"
+        let versionNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
         let version = NSTextField(labelWithString: "TrafficBar \(versionNumber)")
         version.textColor = .tertiaryLabelColor
         version.font = .systemFont(ofSize: 10.5, weight: .medium)
@@ -748,9 +809,9 @@ private final class TrafficBarApp: NSObject, NSApplicationDelegate {
             popover.behavior = .transient
             popover.animates = true
             popover.contentSize = NSSize(width: 360, height: 500)
-            popover.contentViewController = dashboard
             session.onChange = { [weak dashboard] in dashboard?.reload() }
             session.start()
+            popover.contentViewController = dashboard
         } catch {
             let alert = NSAlert()
             alert.messageText = "流量管家无法启动"

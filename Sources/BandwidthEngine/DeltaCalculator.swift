@@ -58,10 +58,20 @@ public final class DeltaCalculator: @unchecked Sendable {
 
     public init() {}
 
+    public func reset() {
+        lock.lock()
+        previous = [:]
+        previousInterfaces = [:]
+        previousSampleTime = nil
+        relayEvidence = [:]
+        lock.unlock()
+    }
+
     public func consume(
         _ snapshots: [ProcessSnapshot],
         interfaceTotals: [String: BytePair] = [:],
         proxySettings: ProxySettings,
+        networkContext: NetworkContext? = nil,
         at time: Date = Date()
     ) -> SampleResult {
         lock.lock()
@@ -70,7 +80,7 @@ public final class DeltaCalculator: @unchecked Sendable {
         let elapsed = max(time.timeIntervalSince(previousSampleTime ?? time), 1)
         previousSampleTime = time
         let budgets = updateInterfaceBudgets(interfaceTotals)
-        let classifier = RouteClassifier(proxySettings: proxySettings)
+        let classifier = RouteClassifier(proxySettings: proxySettings, networkContext: networkContext)
         var candidates: [Candidate] = []
         var activeKeys = Set<String>()
 
@@ -137,6 +147,10 @@ public final class DeltaCalculator: @unchecked Sendable {
         previous = previous.filter { activeKeys.contains($0.key) }
         relayEvidence = relayEvidence.filter { activeKeys.contains($0.key) }
 
+        var physicalLocalTraffic = physicalLocalTraffic(in: candidates)
+        if let externalBudget = budgets.external {
+            physicalLocalTraffic = physicalLocalTraffic.capped(to: externalBudget)
+        }
         let relayKeys = detectedRelayKeys(in: candidates)
         let hasForwardingRelay = !relayKeys.isEmpty
         var mutable = candidates.map { candidate -> MutableDelta in
@@ -159,14 +173,35 @@ public final class DeltaCalculator: @unchecked Sendable {
             return MutableDelta(key: candidate.name, name: candidate.name, pid: candidate.pid, bytes: paths)
         }
 
-        var unattributed: [TrafficPath: BytePair] = [:]
-        if let externalBudget = budgets.external {
+        var unattributed: [MutableDelta] = []
+        if var externalBudget = budgets.external {
+            externalBudget.subtract(physicalLocalTraffic)
             let residual = balance(&mutable, paths: [.proxy, .direct], limit: externalBudget)
-            if residual.total > 0 { unattributed[.direct] = residual }
+            if residual.total > 0 {
+                unattributed.append(
+                    MutableDelta(
+                        key: "__unattributed_external__",
+                        name: "未归属外网",
+                        pid: 0,
+                        bytes: [.direct: residual]
+                    )
+                )
+            }
         }
-        if let localBudget = budgets.local {
+        var localBudget = budgets.local ?? BytePair()
+        localBudget.add(physicalLocalTraffic)
+        if budgets.local != nil || physicalLocalTraffic.total > 0 {
             let residual = balance(&mutable, paths: [.local], limit: localBudget)
-            if residual.total > 0 { unattributed[.local] = residual }
+            if residual.total > 0 {
+                unattributed.append(
+                    MutableDelta(
+                        key: "__unattributed_local__",
+                        name: "未归属本地通信",
+                        pid: 0,
+                        bytes: [.local: residual]
+                    )
+                )
+            }
         }
 
         mutable = mutable.compactMap { item in
@@ -175,16 +210,7 @@ public final class DeltaCalculator: @unchecked Sendable {
             return item.bytes.isEmpty ? nil : item
         }
 
-        if !unattributed.isEmpty {
-            mutable.append(
-                MutableDelta(
-                    key: "__unattributed__",
-                    name: "其他网络流量",
-                    pid: 0,
-                    bytes: unattributed
-                )
-            )
-        }
+        mutable.append(contentsOf: unattributed)
 
         let deltas = mutable.map {
             TrafficDelta(key: $0.key, name: $0.name, pid: $0.pid, bytes: $0.bytes)
@@ -285,6 +311,15 @@ public final class DeltaCalculator: @unchecked Sendable {
         }
 
         return detected
+    }
+
+    private func physicalLocalTraffic(in candidates: [Candidate]) -> BytePair {
+        candidates.reduce(into: BytePair()) { total, candidate in
+            for (route, bytes) in candidate.routes
+            where route.path == .local && InterfaceCounterSampler.isPhysical(route.interfaceName) {
+                total.add(bytes)
+            }
+        }
     }
 
     private func similarity(_ lhs: BytePair, _ rhs: BytePair) -> Double {

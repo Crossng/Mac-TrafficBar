@@ -67,9 +67,11 @@ public struct ProxySettings: Sendable {
 
 public struct RouteClassifier: Sendable {
     public let proxySettings: ProxySettings
+    public let networkContext: NetworkContext?
 
-    public init(proxySettings: ProxySettings) {
+    public init(proxySettings: ProxySettings, networkContext: NetworkContext? = nil) {
         self.proxySettings = proxySettings
+        self.networkContext = networkContext
     }
 
     public func classify(_ connection: ConnectionSnapshot) -> TrafficPath {
@@ -80,6 +82,12 @@ public struct RouteClassifier: Sendable {
         }
 
         if identity.local.isLoopback || identity.remote.isLoopback || identity.interfaceName.lowercased() == "lo0" {
+            return .local
+        }
+
+        if let networkContext,
+           InterfaceCounterSampler.isPhysical(identity.interfaceName),
+           networkContext.containsLocalAddress(identity.remote.host) {
             return .local
         }
 

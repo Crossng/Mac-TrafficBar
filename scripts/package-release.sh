@@ -106,6 +106,7 @@ shasum -a 256 "$ARCHIVE" | awk '{print $1}' > "$ARCHIVE.sha256"
 
 if [[ -n "${SPARKLE_PRIVATE_KEY:-}" && -n "$REPOSITORY" ]]; then
     [[ -x "$SPARKLE_BIN_DIR/generate_appcast" ]] || die "Sparkle generate_appcast not found"
+    rm -f "$DIST_DIR/appcast.xml"
     cp "$DMG" "$APPCAST_DIR/"
     printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SPARKLE_BIN_DIR/generate_appcast" \
         --ed-key-file - \

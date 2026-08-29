@@ -14,6 +14,29 @@ private func total(of result: SampleResult) -> BytePair {
     result.deltas.reduce(into: BytePair()) { $0.add($1.total) }
 }
 
+private func total(of result: SampleResult, path: TrafficPath) -> BytePair {
+    result.deltas.reduce(into: BytePair()) { output, delta in
+        if let bytes = delta.bytes[path] { output.add(bytes) }
+    }
+}
+
+private func hotspotContext(
+    networkID: String = "wifi:test-hotspot",
+    sessionID: String = "wifi:test-hotspot|1000",
+    connectedAt: Date? = Date(timeIntervalSince1970: 1_000)
+) -> NetworkContext {
+    NetworkContext(
+        networkID: networkID,
+        sessionID: sessionID,
+        interfaceName: "en0",
+        gateway: "192.168.43.1",
+        addresses: ["192.168.43.174"],
+        subnetMasks: ["255.255.255.0"],
+        connectedAt: connectedAt,
+        kind: .hotspot
+    )
+}
+
 private func connection(
     protocolName: String = "tcp4",
     local: String,
@@ -62,6 +85,24 @@ private func runVerification() throws {
     let classifier = RouteClassifier(proxySettings: settings)
     try expect(classifier.classify(parsed[0].connections[0]) == .proxy, "代理端点必须优先于回环分类")
     try expect(classifier.classify(parsed[0].connections[1]) == .direct, "utun 不能自动归类为代理")
+    let hotspot = hotspotContext()
+    let hotspotClassifier = RouteClassifier(proxySettings: settings, networkContext: hotspot)
+    let hotspotLocal = connection(
+        local: "192.168.43.174:5000",
+        remote: "192.168.43.1:8080",
+        interface: "en0",
+        downloaded: 10,
+        uploaded: 10
+    )
+    let hotspotExternal = connection(
+        local: "192.168.43.174:5001",
+        remote: "8.8.8.8:443",
+        interface: "en0",
+        downloaded: 10,
+        uploaded: 10
+    )
+    try expect(hotspotClassifier.classify(hotspotLocal) == .local, "同一热点子网流量必须归为本地通信")
+    try expect(hotspotClassifier.classify(hotspotExternal) == .direct, "互联网目标不能被热点子网误判为本地")
     print("✓ 连接解析与代理分类")
 
     let start = Date(timeIntervalSince1970: 1_000)
@@ -215,7 +256,7 @@ private func runVerification() throws {
         "被确认的隧道客户端流量应归入代理"
     )
     try expect(
-        deDuplicated.deltas.first { $0.name == "其他网络流量" }?.bytes[.direct] == BytePair(downloaded: 10_000, uploaded: 10_000),
+        deDuplicated.deltas.first { $0.name == "未归属外网" }?.bytes[.direct] == BytePair(downloaded: 10_000, uploaded: 10_000),
         "未归属的协议开销应单列"
     )
     try expect(
@@ -326,6 +367,46 @@ private func runVerification() throws {
     try expect(total(of: localCapped) == BytePair(downloaded: 50_000, uploaded: 50_000), "回环两端不得重复累计")
     print("✓ 本地回环流量去重")
 
+    let hotspotBudgetCalculator = DeltaCalculator()
+    let hotspotBudgetBaseline = [
+        snapshot(
+            name: "Phone Local", pid: 501, downloaded: 100_000, uploaded: 50_000,
+            connections: [connection(local: "192.168.43.174:5001", remote: "192.168.43.1:8080", interface: "en0", downloaded: 100_000, uploaded: 50_000)]
+        ),
+        snapshot(
+            name: "Browser", pid: 502, downloaded: 100_000, uploaded: 50_000,
+            connections: [connection(local: "192.168.43.174:5002", remote: "8.8.8.8:443", interface: "en0", downloaded: 100_000, uploaded: 50_000)]
+        )
+    ]
+    let hotspotBudgetNext = [
+        snapshot(
+            name: "Phone Local", pid: 501, downloaded: 140_000, uploaded: 70_000,
+            connections: [connection(local: "192.168.43.174:5001", remote: "192.168.43.1:8080", interface: "en0", downloaded: 140_000, uploaded: 70_000)]
+        ),
+        snapshot(
+            name: "Browser", pid: 502, downloaded: 180_000, uploaded: 70_000,
+            connections: [connection(local: "192.168.43.174:5002", remote: "8.8.8.8:443", interface: "en0", downloaded: 180_000, uploaded: 70_000)]
+        )
+    ]
+    _ = hotspotBudgetCalculator.consume(
+        hotspotBudgetBaseline,
+        interfaceTotals: ["en0": BytePair(downloaded: 8_000_000, uploaded: 4_000_000)],
+        proxySettings: settings,
+        networkContext: hotspot,
+        at: start
+    )
+    let hotspotBudget = hotspotBudgetCalculator.consume(
+        hotspotBudgetNext,
+        interfaceTotals: ["en0": BytePair(downloaded: 8_120_000, uploaded: 4_040_000)],
+        proxySettings: settings,
+        networkContext: hotspot,
+        at: start.addingTimeInterval(5)
+    )
+    try expect(total(of: hotspotBudget, path: .direct) == BytePair(downloaded: 80_000, uploaded: 20_000), "局域网字节不得占用外网预算")
+    try expect(total(of: hotspotBudget, path: .local) == BytePair(downloaded: 40_000, uploaded: 20_000), "热点子网流量必须单独保留")
+    try expect(hotspotBudget.deltas.allSatisfy { $0.name != "未归属外网" }, "已识别局域网流量不得变成未归属外网")
+    print("✓ 热点局域网流量从外网预算分离")
+
     let temporary = FileManager.default.temporaryDirectory
         .appendingPathComponent("TrafficBarVerifier-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: temporary) }
@@ -368,6 +449,49 @@ private func runVerification() throws {
         "默认外网排行不得混入仅有本地通信的进程"
     )
     print("✓ V3 账本恢复与外网/本地语义")
+
+    let networkDirectory = temporary.appendingPathComponent("networks", isDirectory: true)
+    let networkLedger = try TrafficLedger(directoryURL: networkDirectory, referenceDate: now)
+    let hotspotFirst = hotspotContext(
+        networkID: "wifi:phone",
+        sessionID: "wifi:phone|1",
+        connectedAt: now.addingTimeInterval(-60)
+    )
+    let hotspotSecond = hotspotContext(
+        networkID: "wifi:phone",
+        sessionID: "wifi:phone|2",
+        connectedAt: now.addingTimeInterval(1)
+    )
+    let homeWiFi = NetworkContext(
+        networkID: "wifi:home",
+        sessionID: "wifi:home|1",
+        interfaceName: "en0",
+        gateway: "192.168.1.1",
+        addresses: ["192.168.1.20"],
+        subnetMasks: ["255.255.255.0"],
+        connectedAt: now.addingTimeInterval(2),
+        kind: .wifi
+    )
+    networkLedger.record(deltas, at: now, networkContext: hotspotFirst)
+    networkLedger.record(compactDelta(7), at: now.addingTimeInterval(1), networkContext: hotspotSecond)
+    networkLedger.record(compactDelta(11), at: now.addingTimeInterval(2), networkContext: homeWiFi)
+
+    let networkReloaded = try TrafficLedger(directoryURL: networkDirectory, referenceDate: now.addingTimeInterval(2))
+    try expect(
+        networkReloaded.currentSessionSummary(for: hotspotFirst, at: now.addingTimeInterval(2))?.total(filter: .external) == BytePair(downloaded: 30, uploaded: 10),
+        "本次热点会话必须跨重启恢复"
+    )
+    try expect(
+        networkReloaded.currentSessionSummary(for: hotspotSecond, at: now.addingTimeInterval(2))?.total(filter: .external) == BytePair(downloaded: 7, uploaded: 0),
+        "同一热点重新连接后必须开启独立会话"
+    )
+    let perNetwork = networkReloaded.networkSummaries(window: .today, at: now.addingTimeInterval(2))
+    try expect(perNetwork.count == 2, "不同 Wi-Fi/热点必须分别记账")
+    try expect(
+        perNetwork.first { $0.networkID == "wifi:phone" }?.total(filter: .external) == BytePair(downloaded: 37, uploaded: 10),
+        "同一网络的多次连接必须汇总到该网络"
+    )
+    print("✓ 按网络与本次连接分别记账")
 
     let compactDirectory = temporary.appendingPathComponent("compact", isDirectory: true)
     let calendar = Calendar.current
