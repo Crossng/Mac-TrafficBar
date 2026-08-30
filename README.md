@@ -20,6 +20,12 @@
   <a href="https://github.com/Crossng/Mac-TrafficBar/releases">查看历史版本</a>
 </p>
 
+<p align="center">
+  <strong>简体中文</strong>
+  ·
+  <a href="README.en.md">English</a>
+</p>
+
 ---
 
 流量管家是一款原生 macOS 菜单栏工具。它将系统网络数据整理为直观的实时速度、时间段汇总和应用流量排行，无需打开复杂的网络工具。
